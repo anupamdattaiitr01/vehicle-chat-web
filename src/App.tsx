@@ -1,5 +1,6 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { socket } from './socket';
+import CryptoJS from 'crypto-js'; // For payload encryption
 
 interface User {
   _id: string;
@@ -8,33 +9,54 @@ interface User {
   phone: string;
 }
 
-interface Message {
-  _id?: string;
-  senderId: string;
-  content: string;
-  createdAt?: string; 
+interface DriverRoom {
+  driverId: string;
+  driverName: string;
+  driverPhone: string;
+  roomId: string;
 }
 
-// Valid 24-character hexadecimal strings required for MongoDB ObjectIds
-const MOCK_COMMUNITY_ROOM = '651f8a700000000000000001';
-const MOCK_PERSONAL_ROOM = '651f8a700000000000000002';
+interface Message {
+  _id?: string;
+  roomId?: string;
+  senderId: string;
+  content: string;
+  createdAt?: string;
+}
+
+// Shared secret key for AES encryption (must match the backend)
+const ENCRYPTION_KEY = 'fleet_payload_secret_2026';
 
 export default function App() {
-  // Authentication State
+  // Authentication & Registration State
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(null);
+  const [isRegisterMode, setIsRegisterMode] = useState(false);
+  const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
   const [password, setPassword] = useState('');
-  const [loginError, setLoginError] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [authSuccess, setAuthSuccess] = useState('');
+
+  // Dynamic Room State
+  const [communityRoomId, setCommunityRoomId] = useState<string>('');
+  const [driverRooms, setDriverRooms] = useState<DriverRoom[]>([]);
+  const [currentRoom, setCurrentRoom] = useState<string>('');
+  const [loadingRooms, setLoadingRooms] = useState(false);
 
   // Chat State
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
-  const [currentRoom, setCurrentRoom] = useState(MOCK_COMMUNITY_ROOM);
   const [typingStatus, setTypingStatus] = useState<string | null>(null);
 
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  // Track the active room in a ref so incoming socket events only append to the active room
+  const activeRoomRef = useRef<string>('');
+
+  useEffect(() => {
+    activeRoomRef.current = currentRoom;
+  }, [currentRoom]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -44,57 +66,109 @@ export default function App() {
     scrollToBottom();
   }, [messages]);
 
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoginError('');
-    
+  // Fetch dynamic rooms (Community Hub + all drivers assigned to this manager)
+  const fetchMyRooms = useCallback(async (authToken: string) => {
+    setLoadingRooms(true);
     try {
-      const response = await fetch('http://localhost:5001/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone, password }),
+      const response = await fetch('http://localhost:5001/api/rooms/my-rooms', {
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+        },
       });
-      
-      const data = await response.json();
-      
+
       if (response.ok) {
-        setToken(data.token);
-        setCurrentUser(data.user);
-      } else {
-        setLoginError(data.error || 'Login failed');
+        const data = await response.json();
+        setCommunityRoomId(data.communityRoomId || '');
+        setDriverRooms(data.drivers || []);
+
+        // Default to Community Hub on initial login
+        setCurrentRoom((prev) => prev || data.communityRoomId || '');
       }
     } catch (error) {
-      setLoginError('Network error. Is the backend running?');
+      console.error('Failed to fetch assigned rooms:', error);
+    } finally {
+      setLoadingRooms(false);
+    }
+  }, []);
+
+  // Handle both Manager Login and Manager Registration with AES encryption
+  const handleAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError('');
+    setAuthSuccess('');
+
+    try {
+      if (isRegisterMode) {
+        // 1. Encrypt Manager registration details
+        const rawPayload = JSON.stringify({
+          name: name.trim(),
+          phone: phone.trim(),
+          password,
+          role: 'manager',
+        });
+        const encryptedPayload = CryptoJS.AES.encrypt(rawPayload, ENCRYPTION_KEY).toString();
+
+        const response = await fetch('http://localhost:5001/api/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: encryptedPayload }),
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+          setAuthSuccess('Manager registered successfully! Please log in.');
+          setPassword('');
+          setIsRegisterMode(false); // Keep phone number pre-filled for immediate login
+        } else {
+          setAuthError(data.error || 'Registration failed');
+        }
+      } else {
+        // 2. Encrypt Manager login credentials
+        const rawPayload = JSON.stringify({
+          phone: phone.trim(),
+          password,
+        });
+        const encryptedPayload = CryptoJS.AES.encrypt(rawPayload, ENCRYPTION_KEY).toString();
+
+        const response = await fetch('http://localhost:5001/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: encryptedPayload }),
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+          if (data.user.role !== 'manager') {
+            setAuthError('Access denied: This dashboard is for Managers only.');
+            return;
+          }
+          setToken(data.token);
+          setCurrentUser(data.user);
+        } else {
+          setAuthError(data.error || 'Login failed');
+        }
+      }
+    } catch (error) {
+      setAuthError('Network error. Is the backend running?');
     }
   };
 
+  // Connect authenticated socket and load manager's rooms once logged in
   useEffect(() => {
-    // Only connect and fetch if the user is actually logged in and has a token
     if (!currentUser || !token) return;
 
-    // Attach the token and manually connect the socket
+    fetchMyRooms(token);
+
     socket.auth = { token };
     socket.connect();
 
-    const fetchHistory = async () => {
-      try {
-        const response = await fetch(`http://localhost:5001/api/messages/${currentRoom}`);
-        if (response.ok) {
-          const data = await response.json();
-          setMessages(data); 
-        }
-      } catch (error) {
-        console.error('Failed to fetch message history:', error);
-      }
-    };
-
-    fetchHistory();
-
-    // Join room using the real database user ID
-    socket.emit('join_room', { roomId: currentRoom, userId: currentUser._id });
-
     socket.on('receive_message', (newMessage: Message) => {
-      setMessages((prev) => [...prev, newMessage]);
+      // Only append if the message belongs to the currently open room
+      if (!newMessage.roomId || newMessage.roomId === activeRoomRef.current) {
+        setMessages((prev) => [...prev, newMessage]);
+      }
     });
 
     socket.on('display_typing', (data: { userName?: string; isTyping: boolean }) => {
@@ -108,16 +182,42 @@ export default function App() {
     return () => {
       socket.off('receive_message');
       socket.off('display_typing');
-      socket.disconnect(); // Disconnect when logging out or unmounting
+      socket.disconnect();
     };
+  }, [currentUser, token, fetchMyRooms]);
+
+  // Fetch message history and join socket room whenever currentRoom changes
+  useEffect(() => {
+    if (!currentUser || !token || !currentRoom) return;
+
+    setTypingStatus(null);
+
+    const fetchHistory = async () => {
+      try {
+        const response = await fetch(`http://localhost:5001/api/messages/${currentRoom}`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+        if (response.ok) {
+          const data = await response.json();
+          setMessages(data);
+        }
+      } catch (error) {
+        console.error('Failed to fetch message history:', error);
+      }
+    };
+
+    fetchHistory();
+    socket.emit('join_room', { roomId: currentRoom, userId: currentUser._id });
   }, [currentRoom, currentUser, token]);
 
   const handleSendMessage = () => {
-    if (!input.trim() || !currentUser) return;
+    if (!input.trim() || !currentUser || !currentRoom) return;
 
     socket.emit('send_message', {
       roomId: currentRoom,
-      senderId: currentUser._id, 
+      senderId: currentUser._id,
       content: input,
     });
 
@@ -127,7 +227,7 @@ export default function App() {
 
   const handleTyping = (e: React.ChangeEvent<HTMLInputElement>) => {
     setInput(e.target.value);
-    if (!currentUser) return;
+    if (!currentUser || !currentRoom) return;
 
     socket.emit('typing', { roomId: currentRoom, userName: currentUser.name });
 
@@ -138,6 +238,16 @@ export default function App() {
     }, 1500);
   };
 
+  const handleLogout = () => {
+    setCurrentUser(null);
+    setToken(null);
+    setCommunityRoomId('');
+    setDriverRooms([]);
+    setCurrentRoom('');
+    setMessages([]);
+    setPassword('');
+  };
+
   const formatTime = (isoString?: string) => {
     if (!isoString) return '';
     const date = new Date(isoString);
@@ -146,13 +256,60 @@ export default function App() {
     return `${dateString}, ${timeString}`;
   };
 
+  // Determine the title of the active room for the header
+  const getActiveRoomTitle = () => {
+    if (!currentRoom) return 'Loading...';
+    if (currentRoom === communityRoomId) return 'Community Hub (All Drivers & Managers)';
+    const selectedDriver = driverRooms.find((d) => d.roomId === currentRoom);
+    return selectedDriver
+      ? `${selectedDriver.driverName} (${selectedDriver.driverPhone})`
+      : 'Personal Chat';
+  };
+
+  // Auth Screen (Login / Register Toggle)
   if (!currentUser || !token) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', background: '#ecf0f1', fontFamily: 'sans-serif' }}>
-        <form onSubmit={handleLogin} style={{ background: 'white', padding: '2rem', borderRadius: '8px', boxShadow: '0 4px 6px rgba(0,0,0,0.1)', display: 'flex', flexDirection: 'column', gap: '1rem', width: '300px' }}>
-          <h2 style={{ margin: 0, textAlign: 'center', color: '#2c3e50' }}>Manager Login</h2>
-          {loginError && <div style={{ color: '#e74c3c', fontSize: '0.9rem', textAlign: 'center' }}>{loginError}</div>}
-          
+        <form
+          onSubmit={handleAuthSubmit}
+          style={{
+            background: 'white',
+            padding: '2rem',
+            borderRadius: '8px',
+            boxShadow: '0 4px 6px rgba(0,0,0,0.1)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '1rem',
+            width: '340px',
+          }}
+        >
+          <h2 style={{ margin: 0, textAlign: 'center', color: '#2c3e50' }}>
+            {isRegisterMode ? 'Manager Registration' : 'Manager Login'}
+          </h2>
+
+          {authError && (
+            <div style={{ color: '#e74c3c', fontSize: '0.85rem', textAlign: 'center', background: '#fdecea', padding: '8px', borderRadius: '4px' }}>
+              {authError}
+            </div>
+          )}
+
+          {authSuccess && (
+            <div style={{ color: '#27ae60', fontSize: '0.85rem', textAlign: 'center', background: '#eafaf1', padding: '8px', borderRadius: '4px' }}>
+              {authSuccess}
+            </div>
+          )}
+
+          {isRegisterMode && (
+            <input
+              type="text"
+              placeholder="Full Name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              style={{ padding: '10px', borderRadius: '4px', border: '1px solid #ccc' }}
+              required
+            />
+          )}
+
           <input
             type="tel"
             placeholder="Phone Number"
@@ -161,6 +318,7 @@ export default function App() {
             style={{ padding: '10px', borderRadius: '4px', border: '1px solid #ccc' }}
             required
           />
+
           <input
             type="password"
             placeholder="Password"
@@ -169,11 +327,30 @@ export default function App() {
             style={{ padding: '10px', borderRadius: '4px', border: '1px solid #ccc' }}
             required
           />
+
+          {isRegisterMode && (
+            <div style={{ fontSize: '0.85rem', color: '#7f8c8d', background: '#f8f9fa', padding: '8px', borderRadius: '4px', border: '1px solid #e0e0e0' }}>
+              Role: <strong>Manager</strong>
+            </div>
+          )}
+
           <button
             type="submit"
             style={{ padding: '10px', background: '#3498db', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}
           >
-            Log In
+            {isRegisterMode ? 'Register as Manager' : 'Log In'}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setIsRegisterMode(!isRegisterMode);
+              setAuthError('');
+              setAuthSuccess('');
+            }}
+            style={{ background: 'transparent', border: 'none', color: '#3498db', cursor: 'pointer', fontSize: '0.85rem', textDecoration: 'underline' }}
+          >
+            {isRegisterMode ? 'Already registered? Log In' : 'New Manager? Register here'}
           </button>
         </form>
       </div>
@@ -182,46 +359,87 @@ export default function App() {
 
   return (
     <div style={{ display: 'flex', height: '100vh', fontFamily: 'sans-serif' }}>
-      {/* Sidebar Navigation */}
-      <div style={{ width: '250px', background: '#2c3e50', color: 'white', padding: '1rem', display: 'flex', flexDirection: 'column' }}>
-        <h2>Fleet Manager</h2>
-        <div style={{ fontSize: '0.9rem', color: '#bdc3c7', marginBottom: '1rem' }}>Welcome, {currentUser.name}</div>
-        
-        <ul style={{ listStyle: 'none', padding: 0, flex: 1 }}>
+      {/* Dynamic Sidebar Navigation */}
+      <div style={{ width: '270px', background: '#2c3e50', color: 'white', padding: '1rem', display: 'flex', flexDirection: 'column' }}>
+        <h2 style={{ marginBottom: '4px' }}>Fleet Manager</h2>
+        <div style={{ fontSize: '0.85rem', color: '#bdc3c7', marginBottom: '1.25rem' }}>
+          {currentUser.name} ({currentUser.phone})
+        </div>
+
+        <ul style={{ listStyle: 'none', padding: 0, flex: 1, overflowY: 'auto' }}>
+          {/* Shared Community Room */}
           <li
             onClick={() => {
-              setMessages([]);
-              setCurrentRoom(MOCK_COMMUNITY_ROOM);
+              if (currentRoom !== communityRoomId) {
+                setMessages([]);
+                setCurrentRoom(communityRoomId);
+              }
             }}
             style={{
               padding: '10px',
               cursor: 'pointer',
               borderRadius: '4px',
-              background: currentRoom === MOCK_COMMUNITY_ROOM ? '#34495e' : 'transparent',
+              fontWeight: 'bold',
+              background: currentRoom === communityRoomId ? '#34495e' : 'transparent',
             }}
           >
             Community Hub
           </li>
-          <li
-            onClick={() => {
-              setMessages([]);
-              setCurrentRoom(MOCK_PERSONAL_ROOM);
-            }}
-            style={{
-              padding: '10px',
-              cursor: 'pointer',
-              borderRadius: '4px',
-              marginTop: '5px',
-              background: currentRoom === MOCK_PERSONAL_ROOM ? '#34495e' : 'transparent',
-            }}
-          >
-            Driver 1 (Personal)
-          </li>
+
+          {/* Assigned Drivers Header + Refresh Button */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '18px', marginBottom: '8px', padding: '0 4px' }}>
+            <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: '#95a5a6' }}>
+              My Drivers ({driverRooms.length})
+            </span>
+            <button
+              onClick={() => fetchMyRooms(token)}
+              disabled={loadingRooms}
+              style={{
+                background: '#34495e',
+                color: '#ecf0f1',
+                border: 'none',
+                borderRadius: '4px',
+                padding: '3px 8px',
+                fontSize: '0.75rem',
+                cursor: 'pointer',
+              }}
+            >
+              {loadingRooms ? '...' : 'Refresh'}
+            </button>
+          </div>
+
+          {driverRooms.length === 0 ? (
+            <li style={{ fontSize: '0.8rem', color: '#95a5a6', padding: '8px 4px', fontStyle: 'italic' }}>
+              No drivers registered under you yet.
+            </li>
+          ) : (
+            driverRooms.map((driver) => (
+              <li
+                key={driver.driverId}
+                onClick={() => {
+                  if (currentRoom !== driver.roomId) {
+                    setMessages([]);
+                    setCurrentRoom(driver.roomId);
+                  }
+                }}
+                style={{
+                  padding: '10px',
+                  cursor: 'pointer',
+                  borderRadius: '4px',
+                  marginTop: '4px',
+                  background: currentRoom === driver.roomId ? '#34495e' : 'transparent',
+                }}
+              >
+                <div style={{ fontWeight: 500 }}>{driver.driverName}</div>
+                <div style={{ fontSize: '0.75rem', color: '#bdc3c7' }}>{driver.driverPhone}</div>
+              </li>
+            ))
+          )}
         </ul>
 
-        <button 
-          onClick={() => { setCurrentUser(null); setToken(null); }}
-          style={{ padding: '10px', background: '#e74c3c', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
+        <button
+          onClick={handleLogout}
+          style={{ padding: '10px', background: '#e74c3c', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', marginTop: '10px' }}
         >
           Log Out
         </button>
@@ -229,13 +447,13 @@ export default function App() {
 
       {/* Main Chat Interface */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '1rem' }}>
-        <h3>Active Room: {currentRoom === MOCK_COMMUNITY_ROOM ? 'Community Hub' : 'Driver 1 Personal'}</h3>
+        <h3>Active Room: {getActiveRoomTitle()}</h3>
 
         <div style={{ flex: 1, border: '1px solid #ccc', padding: '1rem', overflowY: 'auto', marginBottom: '1rem', borderRadius: '4px' }}>
           {messages.map((msg, idx) => {
-            const isMe = msg.senderId === currentUser._id; 
+            const isMe = msg.senderId === currentUser._id;
             return (
-              <div key={idx} style={{ marginBottom: '10px', textAlign: isMe ? 'right' : 'left' }}>
+              <div key={msg._id || idx} style={{ marginBottom: '10px', textAlign: isMe ? 'right' : 'left' }}>
                 <div style={{ display: 'inline-block', maxWidth: '60%', textAlign: isMe ? 'right' : 'left' }}>
                   <span
                     style={{
@@ -245,7 +463,7 @@ export default function App() {
                       borderRadius: '15px',
                       display: 'inline-block',
                       wordBreak: 'break-word',
-                      textAlign: 'left'
+                      textAlign: 'left',
                     }}
                   >
                     {msg.content}
@@ -257,13 +475,13 @@ export default function App() {
               </div>
             );
           })}
-          
+
           {typingStatus && (
             <div style={{ fontSize: '0.8rem', color: '#7f8c8d', fontStyle: 'italic', marginTop: '5px' }}>
               {typingStatus}
             </div>
           )}
-          
+
           <div ref={messagesEndRef} />
         </div>
 
