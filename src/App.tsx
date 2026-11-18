@@ -44,6 +44,15 @@ export default function App() {
   const [currentRoom, setCurrentRoom] = useState<string>('');
   const [loadingRooms, setLoadingRooms] = useState(false);
 
+  // Add Driver Modal State
+  const [isAddDriverOpen, setIsAddDriverOpen] = useState(false);
+  const [driverName, setDriverName] = useState('');
+  const [driverPhone, setDriverPhone] = useState('');
+  const [driverPassword, setDriverPassword] = useState('');
+  const [showDriverPassword, setShowDriverPassword] = useState(false);
+  const [addingDriver, setAddingDriver] = useState(false);
+  const [addDriverError, setAddDriverError] = useState('');
+
   // Chat State
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -150,9 +159,77 @@ export default function App() {
           setAuthError(data.error || 'Login failed');
         }
       }
-    } catch (error) {
+    } catch {
       setAuthError('Network error. Is the backend running?');
     }
+  };
+
+  // Provision a new driver under the logged-in Manager
+  const handleAddDriverSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token) return;
+
+    setAddDriverError('');
+
+    if (!driverName.trim() || !driverPhone.trim() || !driverPassword.trim()) {
+      setAddDriverError('Driver name, phone number, and password are required.');
+      return;
+    }
+
+    setAddingDriver(true);
+    try {
+      const rawPayload = JSON.stringify({
+        name: driverName.trim(),
+        phone: driverPhone.trim(),
+        password: driverPassword.trim(),
+      });
+      const encryptedPayload = CryptoJS.AES.encrypt(rawPayload, ENCRYPTION_KEY).toString();
+
+      const response = await fetch('http://localhost:5001/api/rooms/add-driver', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ data: encryptedPayload }),
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        await fetchMyRooms(token);
+        if (data.driver?.roomId) {
+          setMessages([]);
+          setCurrentRoom(data.driver.roomId);
+        }
+        closeAddDriverModal();
+      } else {
+        setAddDriverError(data.error || 'Failed to add driver.');
+      }
+    } catch {
+      setAddDriverError('Network error. Is the backend running?');
+    } finally {
+      setAddingDriver(false);
+    }
+  };
+
+  const openAddDriverModal = () => {
+    setDriverName('');
+    setDriverPhone('');
+    setDriverPassword('');
+    setShowDriverPassword(false);
+    setAddDriverError('');
+    setIsAddDriverOpen(true);
+  };
+
+  const closeAddDriverModal = () => {
+    if (addingDriver) return;
+    setIsAddDriverOpen(false);
+    setDriverName('');
+    setDriverPhone('');
+    setDriverPassword('');
+    setShowDriverPassword(false);
+    setAddDriverError('');
   };
 
   // Connect authenticated socket and load manager's rooms once logged in
@@ -246,6 +323,7 @@ export default function App() {
     setCurrentRoom('');
     setMessages([]);
     setPassword('');
+    setIsAddDriverOpen(false);
   };
 
   const formatTime = (isoString?: string) => {
@@ -266,7 +344,7 @@ export default function App() {
       : 'Personal Chat';
   };
 
-  // Auth Screen (Login / Register Toggle)
+  // Auth Screen (Manager Login / Register Toggle)
   if (!currentUser || !token) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', background: '#ecf0f1', fontFamily: 'sans-serif' }}>
@@ -358,9 +436,9 @@ export default function App() {
   }
 
   return (
-    <div style={{ display: 'flex', height: '100vh', fontFamily: 'sans-serif' }}>
+    <div style={{ display: 'flex', height: '100vh', fontFamily: 'sans-serif', position: 'relative' }}>
       {/* Dynamic Sidebar Navigation */}
-      <div style={{ width: '270px', background: '#2c3e50', color: 'white', padding: '1rem', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ width: '280px', background: '#2c3e50', color: 'white', padding: '1rem', display: 'flex', flexDirection: 'column' }}>
         <h2 style={{ marginBottom: '4px' }}>Fleet Manager</h2>
         <div style={{ fontSize: '0.85rem', color: '#bdc3c7', marginBottom: '1.25rem' }}>
           {currentUser.name} ({currentUser.phone})
@@ -386,31 +464,50 @@ export default function App() {
             Community Hub
           </li>
 
-          {/* Assigned Drivers Header + Refresh Button */}
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '18px', marginBottom: '8px', padding: '0 4px' }}>
+          {/* Assigned Drivers Header + Add Driver & Refresh Buttons */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '18px', marginBottom: '8px', padding: '0 4px', gap: '6px' }}>
             <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: '#95a5a6' }}>
               My Drivers ({driverRooms.length})
             </span>
-            <button
-              onClick={() => fetchMyRooms(token)}
-              disabled={loadingRooms}
-              style={{
-                background: '#34495e',
-                color: '#ecf0f1',
-                border: 'none',
-                borderRadius: '4px',
-                padding: '3px 8px',
-                fontSize: '0.75rem',
-                cursor: 'pointer',
-              }}
-            >
-              {loadingRooms ? '...' : 'Refresh'}
-            </button>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <button
+                type="button"
+                onClick={openAddDriverModal}
+                style={{
+                  background: '#27ae60',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '4px',
+                  padding: '4px 8px',
+                  fontSize: '0.75rem',
+                  fontWeight: 'bold',
+                  cursor: 'pointer',
+                }}
+              >
+                + Add Driver
+              </button>
+              <button
+                type="button"
+                onClick={() => fetchMyRooms(token)}
+                disabled={loadingRooms}
+                style={{
+                  background: '#34495e',
+                  color: '#ecf0f1',
+                  border: 'none',
+                  borderRadius: '4px',
+                  padding: '4px 8px',
+                  fontSize: '0.75rem',
+                  cursor: 'pointer',
+                }}
+              >
+                {loadingRooms ? '...' : 'Refresh'}
+              </button>
+            </div>
           </div>
 
           {driverRooms.length === 0 ? (
             <li style={{ fontSize: '0.8rem', color: '#95a5a6', padding: '8px 4px', fontStyle: 'italic' }}>
-              No drivers registered under you yet.
+              No drivers assigned yet. Click "+ Add Driver" to register one.
             </li>
           ) : (
             driverRooms.map((driver) => (
@@ -502,6 +599,136 @@ export default function App() {
           </button>
         </div>
       </div>
+
+      {/* Add Driver Modal */}
+      {isAddDriverOpen && (
+        <div
+          onClick={closeAddDriverModal}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0, 0, 0, 0.55)',
+            display: 'flex',
+            justifyContent: 'center',
+            alignItems: 'center',
+            zIndex: 1000,
+          }}
+        >
+          <form
+            onSubmit={handleAddDriverSubmit}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: 'white',
+              padding: '1.75rem',
+              borderRadius: '8px',
+              boxShadow: '0 8px 24px rgba(0, 0, 0, 0.2)',
+              width: '360px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '0.9rem',
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3 style={{ margin: 0, color: '#2c3e50' }}>Add Driver to Fleet</h3>
+              <button
+                type="button"
+                onClick={closeAddDriverModal}
+                disabled={addingDriver}
+                style={{ background: 'transparent', border: 'none', fontSize: '1.2rem', cursor: 'pointer', color: '#7f8c8d' }}
+              >
+                ×
+              </button>
+            </div>
+
+            <p style={{ margin: 0, fontSize: '0.82rem', color: '#7f8c8d' }}>
+              Create login credentials for your driver. Share the phone number and password with them to sign in on the mobile app.
+            </p>
+
+            {addDriverError && (
+              <div style={{ color: '#e74c3c', fontSize: '0.85rem', background: '#fdecea', padding: '8px 10px', borderRadius: '4px' }}>
+                {addDriverError}
+              </div>
+            )}
+
+            <input
+              type="text"
+              placeholder="Driver Full Name"
+              value={driverName}
+              onChange={(e) => setDriverName(e.target.value)}
+              style={{ padding: '10px', borderRadius: '4px', border: '1px solid #ccc' }}
+              required
+            />
+
+            <input
+              type="tel"
+              placeholder="Driver Phone Number"
+              value={driverPhone}
+              onChange={(e) => setDriverPhone(e.target.value)}
+              style={{ padding: '10px', borderRadius: '4px', border: '1px solid #ccc' }}
+              required
+            />
+
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <input
+                type={showDriverPassword ? 'text' : 'password'}
+                placeholder="Assign Login Password"
+                value={driverPassword}
+                onChange={(e) => setDriverPassword(e.target.value)}
+                style={{ flex: 1, padding: '10px', borderRadius: '4px', border: '1px solid #ccc' }}
+                required
+              />
+              <button
+                type="button"
+                onClick={() => setShowDriverPassword((prev) => !prev)}
+                style={{
+                  padding: '0 10px',
+                  background: '#ecf0f1',
+                  border: '1px solid #ccc',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                  fontSize: '0.8rem',
+                  color: '#2c3e50',
+                }}
+              >
+                {showDriverPassword ? 'Hide' : 'Show'}
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '0.5rem' }}>
+              <button
+                type="button"
+                onClick={closeAddDriverModal}
+                disabled={addingDriver}
+                style={{
+                  padding: '9px 14px',
+                  background: '#ecf0f1',
+                  color: '#2c3e50',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={addingDriver}
+                style={{
+                  padding: '9px 16px',
+                  background: '#27ae60',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                  fontWeight: 'bold',
+                }}
+              >
+                {addingDriver ? 'Adding...' : 'Create & Assign Driver'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }
