@@ -25,6 +25,24 @@ interface Message {
   createdAt?: string;
 }
 
+interface Booking {
+  _id: string;
+  managerId: string;
+  managerName?: string;
+  driverId: string;
+  driverName?: string;
+  roomId: string;
+  passengerName: string;
+  passengerPhone: string;
+  pickupLocation: string;
+  dropLocation: string;
+  scheduledTime: string;
+  notes?: string;
+  status: 'pending' | 'confirmed' | 'query_raised';
+  queryMessage?: string;
+  createdAt?: string;
+}
+
 type ThemeMode = 'dark' | 'light';
 
 const ENCRYPTION_KEY = 'fleet_payload_secret_2026';
@@ -70,6 +88,18 @@ export default function App() {
   const [addingDriver, setAddingDriver] = useState(false);
   const [addDriverError, setAddDriverError] = useState('');
 
+  // Ride Bookings & Assign Ride Modal State
+  const [bookings, setBookings] = useState<Booking[]>([]);
+  const [isAssignRideOpen, setIsAssignRideOpen] = useState(false);
+  const [passengerName, setPassengerName] = useState('');
+  const [passengerPhone, setPassengerPhone] = useState('');
+  const [pickupLocation, setPickupLocation] = useState('');
+  const [dropLocation, setDropLocation] = useState('');
+  const [scheduledTime, setScheduledTime] = useState('');
+  const [rideNotes, setRideNotes] = useState('');
+  const [assigningRide, setAssigningRide] = useState(false);
+  const [assignRideError, setAssignRideError] = useState('');
+
   // Chat State
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -112,6 +142,26 @@ export default function App() {
       console.error('Failed to fetch assigned rooms:', error);
     } finally {
       setLoadingRooms(false);
+    }
+  }, []);
+
+  // Fetch all ride bookings assigned by this manager
+  const fetchMyBookings = useCallback(async (authToken: string) => {
+    try {
+      const response = await fetch(
+        'http://localhost:5001/api/bookings/my-bookings',
+        {
+          headers: {
+            Authorization: `Bearer ${authToken}`,
+          },
+        }
+      );
+      if (response.ok) {
+        const data = (await response.json()) as Booking[];
+        setBookings(data);
+      }
+    } catch (error) {
+      console.error('Failed to fetch bookings:', error);
     }
   }, []);
 
@@ -257,11 +307,83 @@ export default function App() {
     setAddDriverError('');
   };
 
-  // Connect authenticated socket and load manager's rooms once logged in
+  // Assign a new ride booking to the selected driver
+  const handleAssignRideSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token || !activeDriver) return;
+
+    setAssignRideError('');
+
+    if (
+      !passengerName.trim() ||
+      !passengerPhone.trim() ||
+      !pickupLocation.trim() ||
+      !dropLocation.trim() ||
+      !scheduledTime.trim()
+    ) {
+      setAssignRideError(
+        'Passenger name, phone, pickup, drop, and scheduled time are required.'
+      );
+      return;
+    }
+
+    setAssigningRide(true);
+    try {
+      const response = await fetch('http://localhost:5001/api/bookings', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          driverId: activeDriver.driverId,
+          passengerName: passengerName.trim(),
+          passengerPhone: passengerPhone.trim(),
+          pickupLocation: pickupLocation.trim(),
+          dropLocation: dropLocation.trim(),
+          scheduledTime: scheduledTime.trim(),
+          notes: rideNotes.trim(),
+        }),
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        setBookings((prev) => [data as Booking, ...prev]);
+        closeAssignRideModal();
+      } else {
+        setAssignRideError(data.error || 'Failed to assign ride.');
+      }
+    } catch {
+      setAssignRideError('Network error. Is the backend running?');
+    } finally {
+      setAssigningRide(false);
+    }
+  };
+
+  const openAssignRideModal = () => {
+    setPassengerName('');
+    setPassengerPhone('');
+    setPickupLocation('');
+    setDropLocation('');
+    setScheduledTime('');
+    setRideNotes('');
+    setAssignRideError('');
+    setIsAssignRideOpen(true);
+  };
+
+  const closeAssignRideModal = () => {
+    if (assigningRide) return;
+    setIsAssignRideOpen(false);
+    setAssignRideError('');
+  };
+
+  // Connect authenticated socket and load manager's rooms & bookings once logged in
   useEffect(() => {
     if (!currentUser || !token) return;
 
     fetchMyRooms(token);
+    fetchMyBookings(token);
 
     socket.auth = { token };
     socket.connect();
@@ -271,8 +393,28 @@ export default function App() {
 
     socket.on('receive_message', (newMessage: Message) => {
       if (!newMessage.roomId || newMessage.roomId === activeRoomRef.current) {
-        setMessages((prev) => [...prev, newMessage]);
+        setMessages((prev) => {
+          if (
+            newMessage._id &&
+            prev.some((m) => m._id && m._id === newMessage._id)
+          ) {
+            return prev;
+          }
+          return [...prev, newMessage];
+        });
       }
+    });
+
+    socket.on('booking_status_updated', (updatedBooking: Booking) => {
+      setBookings((prev) => {
+        const exists = prev.some((b) => b._id === updatedBooking._id);
+        if (exists) {
+          return prev.map((b) =>
+            b._id === updatedBooking._id ? { ...b, ...updatedBooking } : b
+          );
+        }
+        return [updatedBooking, ...prev];
+      });
     });
 
     socket.on(
@@ -290,11 +432,12 @@ export default function App() {
       socket.off('connect');
       socket.off('disconnect');
       socket.off('receive_message');
+      socket.off('booking_status_updated');
       socket.off('display_typing');
       socket.disconnect();
       setIsSocketConnected(false);
     };
-  }, [currentUser, token, fetchMyRooms]);
+  }, [currentUser, token, fetchMyRooms, fetchMyBookings]);
 
   // Fetch message history and join socket room whenever currentRoom changes
   useEffect(() => {
@@ -356,10 +499,12 @@ export default function App() {
     setToken(null);
     setCommunityRoomId('');
     setDriverRooms([]);
+    setBookings([]);
     setCurrentRoom('');
     setMessages([]);
     setPassword('');
     setIsAddDriverOpen(false);
+    setIsAssignRideOpen(false);
   };
 
   const formatTime = (isoString?: string) => {
@@ -368,8 +513,37 @@ export default function App() {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
+  const getBookingBadgeStyle = (status: Booking['status']) => {
+    if (status === 'confirmed') {
+      return {
+        label: 'CONFIRMED',
+        bg: 'var(--milo-success-bg)',
+        color: 'var(--milo-success-text)',
+        border: 'rgba(46, 204, 113, 0.35)',
+      };
+    }
+    if (status === 'query_raised') {
+      return {
+        label: 'QUERY RAISED',
+        bg: 'var(--milo-error-bg)',
+        color: 'var(--milo-error-text)',
+        border: 'rgba(231, 76, 60, 0.35)',
+      };
+    }
+    return {
+      label: 'PENDING',
+      bg: 'var(--milo-amber-bg)',
+      color: 'var(--milo-amber-text)',
+      border: 'rgba(245, 158, 11, 0.35)',
+    };
+  };
+
   const isCommunityActive = currentRoom === communityRoomId;
   const activeDriver = driverRooms.find((d) => d.roomId === currentRoom);
+  const activeDriverLatestBooking = activeDriver
+    ? bookings.find((b) => b.driverId === activeDriver.driverId)
+    : undefined;
+
   const filteredDrivers = driverRooms.filter(
     (d) =>
       d.driverName.toLowerCase().includes(driverSearch.trim().toLowerCase()) ||
@@ -392,7 +566,6 @@ export default function App() {
           padding: '20px',
         }}
       >
-        {/* Top-Right Dark / Light Pill Switcher */}
         <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
           <ThemePillToggle theme={theme} onChange={setTheme} />
         </div>
@@ -421,7 +594,6 @@ export default function App() {
               gap: '16px',
             }}
           >
-            {/* Milo Drive Logo Badge */}
             <div style={{ display: 'flex', justifyContent: 'center' }}>
               <div
                 style={{
@@ -686,7 +858,6 @@ export default function App() {
           padding: '18px 16px',
         }}
       >
-        {/* Brand Header + Theme Toggle */}
         <div
           style={{
             display: 'flex',
@@ -819,7 +990,6 @@ export default function App() {
             FLEET BROADCAST
           </div>
 
-          {/* Community Hub Row */}
           <button
             type="button"
             className="milo-thread-item"
@@ -920,9 +1090,12 @@ export default function App() {
               </button>
               <button
                 type="button"
-                onClick={() => fetchMyRooms(token)}
+                onClick={() => {
+                  fetchMyRooms(token);
+                  fetchMyBookings(token);
+                }}
                 disabled={loadingRooms}
-                title="Refresh drivers"
+                title="Refresh drivers & bookings"
                 style={{
                   backgroundColor: 'var(--milo-input)',
                   color: 'var(--milo-text-muted)',
@@ -958,6 +1131,13 @@ export default function App() {
           ) : (
             filteredDrivers.map((driver) => {
               const isSelected = currentRoom === driver.roomId;
+              const driverLatestRide = bookings.find(
+                (b) => b.driverId === driver.driverId
+              );
+              const badge = driverLatestRide
+                ? getBookingBadgeStyle(driverLatestRide.status)
+                : null;
+
               return (
                 <button
                   key={driver.driverId}
@@ -1011,14 +1191,38 @@ export default function App() {
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div
                       style={{
-                        fontWeight: 600,
-                        fontSize: '0.9rem',
-                        whiteSpace: 'nowrap',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: '6px',
                       }}
                     >
-                      {driver.driverName}
+                      <span
+                        style={{
+                          fontWeight: 600,
+                          fontSize: '0.9rem',
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                        }}
+                      >
+                        {driver.driverName}
+                      </span>
+                      {badge && (
+                        <span
+                          style={{
+                            backgroundColor: badge.bg,
+                            color: badge.color,
+                            padding: '1px 6px',
+                            borderRadius: '5px',
+                            fontSize: '0.62rem',
+                            fontWeight: 800,
+                            flexShrink: 0,
+                          }}
+                        >
+                          {badge.label}
+                        </span>
+                      )}
                     </div>
                     <div
                       style={{
@@ -1169,7 +1373,118 @@ export default function App() {
               </div>
             </div>
           </div>
+
+          {/* Assign Ride Action Button (for active driver room) */}
+          {!isCommunityActive && activeDriver && (
+            <button
+              type="button"
+              onClick={openAssignRideModal}
+              className="milo-btn-primary"
+              style={{
+                padding: '9px 16px',
+                borderRadius: '12px',
+                fontSize: '0.84rem',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+              }}
+            >
+              <span>⚡</span>
+              <span>Assign Ride</span>
+            </button>
+          )}
         </header>
+
+        {/* Live Assigned Ride Status Banner for Selected Driver */}
+        {!isCommunityActive && activeDriver && activeDriverLatestBooking && (
+          <div
+            style={{
+              padding: '12px 24px',
+              backgroundColor: 'var(--milo-card)',
+              borderBottom: '1px solid var(--milo-border)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '16px',
+              flexWrap: 'wrap',
+            }}
+          >
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span
+                  style={{
+                    fontSize: '0.72rem',
+                    fontWeight: 800,
+                    letterSpacing: '0.06em',
+                    color: 'var(--milo-text-muted)',
+                  }}
+                >
+                  LATEST ASSIGNED RIDE
+                </span>
+                {(() => {
+                  const badge = getBookingBadgeStyle(
+                    activeDriverLatestBooking.status
+                  );
+                  return (
+                    <span
+                      style={{
+                        backgroundColor: badge.bg,
+                        color: badge.color,
+                        border: `1px solid ${badge.border}`,
+                        padding: '2px 8px',
+                        borderRadius: '6px',
+                        fontSize: '0.68rem',
+                        fontWeight: 800,
+                        letterSpacing: '0.04em',
+                      }}
+                    >
+                      {badge.label}
+                    </span>
+                  );
+                })()}
+                <span
+                  style={{
+                    fontSize: '0.8rem',
+                    fontWeight: 700,
+                    color: 'var(--milo-text)',
+                  }}
+                >
+                  • {activeDriverLatestBooking.scheduledTime}
+                </span>
+              </div>
+
+              <div
+                style={{
+                  fontSize: '0.84rem',
+                  color: 'var(--milo-text)',
+                  fontWeight: 500,
+                }}
+              >
+                <strong>{activeDriverLatestBooking.passengerName}</strong> (
+                {activeDriverLatestBooking.passengerPhone}) —{' '}
+                {activeDriverLatestBooking.pickupLocation} →{' '}
+                {activeDriverLatestBooking.dropLocation}
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={openAssignRideModal}
+              style={{
+                padding: '7px 12px',
+                borderRadius: '10px',
+                border: '1px solid var(--milo-border)',
+                backgroundColor: 'var(--milo-input)',
+                color: 'var(--milo-text)',
+                fontSize: '0.78rem',
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              + New Ride
+            </button>
+          </div>
+        )}
 
         {/* Scrollable Message Stream */}
         <div
@@ -1216,7 +1531,7 @@ export default function App() {
             >
               {isCommunityActive
                 ? 'Broadcast fleet updates to all drivers in Community Hub.'
-                : `Send a direct message to ${activeDriver?.driverName || 'your driver'}.`}
+                : `Send a direct message or assign a ride to ${activeDriver?.driverName || 'your driver'}.`}
             </div>
           )}
 
@@ -1246,6 +1561,7 @@ export default function App() {
                     border: isMe ? 'none' : '1px solid var(--milo-border)',
                     fontSize: '0.92rem',
                     lineHeight: 1.45,
+                    whiteSpace: 'pre-wrap',
                     wordBreak: 'break-word',
                   }}
                 >
@@ -1329,6 +1645,279 @@ export default function App() {
           </div>
         </div>
       </main>
+
+      {/* =================================================================== */}
+      {/* ASSIGN RIDE MODAL                                                   */}
+      {/* =================================================================== */}
+      {isAssignRideOpen && activeDriver && (
+        <div
+          onClick={closeAssignRideModal}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.65)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            justifyContent: 'center',
+            alignItems: 'center',
+            padding: '16px',
+            zIndex: 1000,
+          }}
+        >
+          <form
+            onSubmit={handleAssignRideSubmit}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              backgroundColor: 'var(--milo-card)',
+              border: '1px solid var(--milo-border)',
+              borderRadius: '22px',
+              padding: '26px',
+              width: '100%',
+              maxWidth: '450px',
+              boxShadow: 'var(--milo-shadow)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '13px',
+              maxHeight: '92vh',
+              overflowY: 'auto',
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+              }}
+            >
+              <div>
+                <h3
+                  style={{
+                    margin: 0,
+                    fontSize: '1.15rem',
+                    fontWeight: 700,
+                    color: 'var(--milo-text)',
+                  }}
+                >
+                  Assign Ride to {activeDriver.driverName}
+                </h3>
+                <p
+                  style={{
+                    margin: '3px 0 0',
+                    fontSize: '0.8rem',
+                    color: 'var(--milo-text-muted)',
+                  }}
+                >
+                  Triggers an instant full-screen booking card on the driver&apos;s phone
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closeAssignRideModal}
+                disabled={assigningRide}
+                style={{
+                  background: 'var(--milo-input)',
+                  border: '1px solid var(--milo-border)',
+                  borderRadius: '8px',
+                  width: '30px',
+                  height: '30px',
+                  color: 'var(--milo-text-muted)',
+                  fontSize: '1.1rem',
+                  cursor: 'pointer',
+                }}
+              >
+                ×
+              </button>
+            </div>
+
+            {assignRideError && (
+              <div
+                style={{
+                  backgroundColor: 'var(--milo-error-bg)',
+                  color: 'var(--milo-error-text)',
+                  border: '1px solid rgba(231, 76, 60, 0.35)',
+                  borderRadius: '12px',
+                  padding: '10px 12px',
+                  fontSize: '0.84rem',
+                  fontWeight: 500,
+                }}
+              >
+                {assignRideError}
+              </div>
+            )}
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+              <div>
+                <label
+                  style={{
+                    display: 'block',
+                    fontSize: '0.76rem',
+                    fontWeight: 600,
+                    color: 'var(--milo-text-muted)',
+                    marginBottom: '5px',
+                  }}
+                >
+                  Passenger Name
+                </label>
+                <input
+                  type="text"
+                  className="milo-input"
+                  placeholder="e.g. Aarav Mehta"
+                  value={passengerName}
+                  onChange={(e) => setPassengerName(e.target.value)}
+                  required
+                />
+              </div>
+
+              <div>
+                <label
+                  style={{
+                    display: 'block',
+                    fontSize: '0.76rem',
+                    fontWeight: 600,
+                    color: 'var(--milo-text-muted)',
+                    marginBottom: '5px',
+                  }}
+                >
+                  Passenger Phone
+                </label>
+                <input
+                  type="tel"
+                  className="milo-input"
+                  placeholder="e.g. 9811223344"
+                  value={passengerPhone}
+                  onChange={(e) => setPassengerPhone(e.target.value)}
+                  required
+                />
+              </div>
+            </div>
+
+            <div>
+              <label
+                style={{
+                  display: 'block',
+                  fontSize: '0.76rem',
+                  fontWeight: 600,
+                  color: 'var(--milo-text-muted)',
+                  marginBottom: '5px',
+                }}
+              >
+                Pickup Location
+              </label>
+              <input
+                type="text"
+                className="milo-input"
+                placeholder="e.g. Terminal 3, IGI Airport, New Delhi"
+                value={pickupLocation}
+                onChange={(e) => setPickupLocation(e.target.value)}
+                required
+              />
+            </div>
+
+            <div>
+              <label
+                style={{
+                  display: 'block',
+                  fontSize: '0.76rem',
+                  fontWeight: 600,
+                  color: 'var(--milo-text-muted)',
+                  marginBottom: '5px',
+                }}
+              >
+                Drop Location
+              </label>
+              <input
+                type="text"
+                className="milo-input"
+                placeholder="e.g. DLF Cyber Hub, Gurugram"
+                value={dropLocation}
+                onChange={(e) => setDropLocation(e.target.value)}
+                required
+              />
+            </div>
+
+            <div>
+              <label
+                style={{
+                  display: 'block',
+                  fontSize: '0.76rem',
+                  fontWeight: 600,
+                  color: 'var(--milo-text-muted)',
+                  marginBottom: '5px',
+                }}
+              >
+                Scheduled Pickup Time
+              </label>
+              <input
+                type="text"
+                className="milo-input"
+                placeholder="e.g. Today, 5:30 PM"
+                value={scheduledTime}
+                onChange={(e) => setScheduledTime(e.target.value)}
+                required
+              />
+            </div>
+
+            <div>
+              <label
+                style={{
+                  display: 'block',
+                  fontSize: '0.76rem',
+                  fontWeight: 600,
+                  color: 'var(--milo-text-muted)',
+                  marginBottom: '5px',
+                }}
+              >
+                Instructions / Notes (Optional)
+              </label>
+              <input
+                type="text"
+                className="milo-input"
+                placeholder="e.g. Arrival Gate 4 • 2 luggage bags"
+                value={rideNotes}
+                onChange={(e) => setRideNotes(e.target.value)}
+              />
+            </div>
+
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'flex-end',
+                gap: '10px',
+                marginTop: '6px',
+              }}
+            >
+              <button
+                type="button"
+                onClick={closeAssignRideModal}
+                disabled={assigningRide}
+                style={{
+                  padding: '10px 16px',
+                  borderRadius: '12px',
+                  border: '1px solid var(--milo-border)',
+                  backgroundColor: 'var(--milo-input)',
+                  color: 'var(--milo-text)',
+                  fontWeight: 600,
+                  fontSize: '0.86rem',
+                  cursor: 'pointer',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={assigningRide}
+                className="milo-btn-primary"
+                style={{
+                  padding: '10px 18px',
+                  fontSize: '0.86rem',
+                }}
+              >
+                {assigningRide ? 'Dispatching...' : 'Dispatch Ride Alert'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {/* =================================================================== */}
       {/* ADD DRIVER MODAL                                                    */}
