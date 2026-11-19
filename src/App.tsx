@@ -47,6 +47,11 @@ type ThemeMode = 'dark' | 'light';
 
 const ENCRYPTION_KEY = 'fleet_payload_secret_2026';
 const THEME_STORAGE_KEY = 'milo_web_theme';
+const PHONE_REGEX = /^\d{10}$/;
+
+function sanitizePhoneInput(value: string): string {
+  return value.replace(/\D/g, '').slice(0, 10);
+}
 
 export default function App() {
   // Theme State (synced with Milo Drive mobile app palette)
@@ -170,13 +175,20 @@ export default function App() {
     e.preventDefault();
     setAuthError('');
     setAuthSuccess('');
+
+    const cleanPhone = sanitizePhoneInput(phone);
+    if (!PHONE_REGEX.test(cleanPhone)) {
+      setAuthError('Phone number must be exactly 10 digits.');
+      return;
+    }
+
     setIsSubmittingAuth(true);
 
     try {
       if (isRegisterMode) {
         const rawPayload = JSON.stringify({
           name: name.trim(),
-          phone: phone.trim(),
+          phone: cleanPhone,
           password,
           role: 'manager',
         });
@@ -202,7 +214,7 @@ export default function App() {
         }
       } else {
         const rawPayload = JSON.stringify({
-          phone: phone.trim(),
+          phone: cleanPhone,
           password,
         });
         const encryptedPayload = CryptoJS.AES.encrypt(
@@ -243,8 +255,14 @@ export default function App() {
 
     setAddDriverError('');
 
-    if (!driverName.trim() || !driverPhone.trim() || !driverPassword.trim()) {
+    const cleanDriverPhone = sanitizePhoneInput(driverPhone);
+    if (!driverName.trim() || !cleanDriverPhone || !driverPassword.trim()) {
       setAddDriverError('Driver name, phone number, and password are required.');
+      return;
+    }
+
+    if (!PHONE_REGEX.test(cleanDriverPhone)) {
+      setAddDriverError('Driver phone number must be exactly 10 digits.');
       return;
     }
 
@@ -252,7 +270,7 @@ export default function App() {
     try {
       const rawPayload = JSON.stringify({
         name: driverName.trim(),
-        phone: driverPhone.trim(),
+        phone: cleanDriverPhone,
         password: driverPassword.trim(),
       });
       const encryptedPayload = CryptoJS.AES.encrypt(
@@ -314,9 +332,10 @@ export default function App() {
 
     setAssignRideError('');
 
+    const cleanPassengerPhone = sanitizePhoneInput(passengerPhone);
     if (
       !passengerName.trim() ||
-      !passengerPhone.trim() ||
+      !cleanPassengerPhone ||
       !pickupLocation.trim() ||
       !dropLocation.trim() ||
       !scheduledTime.trim()
@@ -324,6 +343,11 @@ export default function App() {
       setAssignRideError(
         'Passenger name, phone, pickup, drop, and scheduled time are required.'
       );
+      return;
+    }
+
+    if (!PHONE_REGEX.test(cleanPassengerPhone)) {
+      setAssignRideError('Passenger phone number must be exactly 10 digits.');
       return;
     }
 
@@ -338,7 +362,7 @@ export default function App() {
         body: JSON.stringify({
           driverId: activeDriver.driverId,
           passengerName: passengerName.trim(),
-          passengerPhone: passengerPhone.trim(),
+          passengerPhone: cleanPassengerPhone,
           pickupLocation: pickupLocation.trim(),
           dropLocation: dropLocation.trim(),
           scheduledTime: scheduledTime.trim(),
@@ -698,23 +722,45 @@ export default function App() {
             )}
 
             <div>
-              <label
+              <div
                 style={{
-                  display: 'block',
-                  fontSize: '0.78rem',
-                  fontWeight: 600,
-                  color: 'var(--milo-text-muted)',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
                   marginBottom: '6px',
                 }}
               >
-                Phone Number
-              </label>
+                <label
+                  style={{
+                    fontSize: '0.78rem',
+                    fontWeight: 600,
+                    color: 'var(--milo-text-muted)',
+                  }}
+                >
+                  Phone Number
+                </label>
+                <span
+                  style={{
+                    fontSize: '0.72rem',
+                    fontWeight: 600,
+                    color:
+                      phone.length === 10
+                        ? 'var(--milo-success-text)'
+                        : 'var(--milo-text-muted)',
+                  }}
+                >
+                  {phone.length}/10
+                </span>
+              </div>
               <input
                 type="tel"
+                inputMode="numeric"
+                pattern="\d{10}"
+                maxLength={10}
                 className="milo-input"
-                placeholder="e.g. 9876543210"
+                placeholder="10-digit mobile number"
                 value={phone}
-                onChange={(e) => setPhone(e.target.value)}
+                onChange={(e) => setPhone(sanitizePhoneInput(e.target.value))}
                 required
               />
             </div>
@@ -794,7 +840,7 @@ export default function App() {
 
             <button
               type="submit"
-              disabled={isSubmittingAuth}
+              disabled={isSubmittingAuth || phone.length !== 10}
               className="milo-btn-primary"
               style={{ padding: '13px', fontSize: '0.96rem', marginTop: '4px' }}
             >
@@ -1769,23 +1815,47 @@ export default function App() {
               </div>
 
               <div>
-                <label
+                <div
                   style={{
-                    display: 'block',
-                    fontSize: '0.76rem',
-                    fontWeight: 600,
-                    color: 'var(--milo-text-muted)',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
                     marginBottom: '5px',
                   }}
                 >
-                  Passenger Phone
-                </label>
+                  <label
+                    style={{
+                      fontSize: '0.76rem',
+                      fontWeight: 600,
+                      color: 'var(--milo-text-muted)',
+                    }}
+                  >
+                    Passenger Phone
+                  </label>
+                  <span
+                    style={{
+                      fontSize: '0.68rem',
+                      fontWeight: 600,
+                      color:
+                        passengerPhone.length === 10
+                          ? 'var(--milo-success-text)'
+                          : 'var(--milo-text-muted)',
+                    }}
+                  >
+                    {passengerPhone.length}/10
+                  </span>
+                </div>
                 <input
                   type="tel"
+                  inputMode="numeric"
+                  pattern="\d{10}"
+                  maxLength={10}
                   className="milo-input"
-                  placeholder="e.g. 9811223344"
+                  placeholder="10-digit number"
                   value={passengerPhone}
-                  onChange={(e) => setPassengerPhone(e.target.value)}
+                  onChange={(e) =>
+                    setPassengerPhone(sanitizePhoneInput(e.target.value))
+                  }
                   required
                 />
               </div>
@@ -1905,7 +1975,7 @@ export default function App() {
               </button>
               <button
                 type="submit"
-                disabled={assigningRide}
+                disabled={assigningRide || passengerPhone.length !== 10}
                 className="milo-btn-primary"
                 style={{
                   padding: '10px 18px',
@@ -2040,23 +2110,47 @@ export default function App() {
             </div>
 
             <div>
-              <label
+              <div
                 style={{
-                  display: 'block',
-                  fontSize: '0.78rem',
-                  fontWeight: 600,
-                  color: 'var(--milo-text-muted)',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
                   marginBottom: '6px',
                 }}
               >
-                Driver Phone Number
-              </label>
+                <label
+                  style={{
+                    fontSize: '0.78rem',
+                    fontWeight: 600,
+                    color: 'var(--milo-text-muted)',
+                  }}
+                >
+                  Driver Phone Number
+                </label>
+                <span
+                  style={{
+                    fontSize: '0.72rem',
+                    fontWeight: 600,
+                    color:
+                      driverPhone.length === 10
+                        ? 'var(--milo-success-text)'
+                        : 'var(--milo-text-muted)',
+                  }}
+                >
+                  {driverPhone.length}/10
+                </span>
+              </div>
               <input
                 type="tel"
+                inputMode="numeric"
+                pattern="\d{10}"
+                maxLength={10}
                 className="milo-input"
-                placeholder="e.g. 8000000011"
+                placeholder="10-digit mobile number"
                 value={driverPhone}
-                onChange={(e) => setDriverPhone(e.target.value)}
+                onChange={(e) =>
+                  setDriverPhone(sanitizePhoneInput(e.target.value))
+                }
                 required
               />
             </div>
@@ -2130,7 +2224,7 @@ export default function App() {
               </button>
               <button
                 type="submit"
-                disabled={addingDriver}
+                disabled={addingDriver || driverPhone.length !== 10}
                 className="milo-btn-primary"
                 style={{
                   padding: '10px 18px',
