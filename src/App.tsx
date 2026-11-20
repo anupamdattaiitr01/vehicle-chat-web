@@ -37,8 +37,11 @@ interface Booking {
   pickupLocation: string;
   dropLocation: string;
   scheduledTime: string;
+  scheduledAt: string;
+  estimatedEndAt: string;
+  durationMinutes: number;
   notes?: string;
-  status: 'pending' | 'confirmed' | 'query_raised';
+  status: 'pending' | 'confirmed' | 'query_raised' | 'cancelled';
   queryMessage?: string;
   createdAt?: string;
 }
@@ -53,8 +56,53 @@ function sanitizePhoneInput(value: string): string {
   return value.replace(/\D/g, '').slice(0, 10);
 }
 
+function toDateTimeLocalValue(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate()
+  )}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatScheduleLabel(date: Date, durationMinutes: number): string {
+  const datePart = date.toLocaleDateString('en-IN', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  });
+  const timePart = date.toLocaleTimeString('en-IN', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
+  const hrs = durationMinutes / 60;
+  const durationLabel =
+    durationMinutes < 60
+      ? `${durationMinutes} mins`
+      : Number.isInteger(hrs)
+      ? `${hrs} hr${hrs > 1 ? 's' : ''}`
+      : `${hrs.toFixed(1)} hrs`;
+
+  return `${datePart}, ${timePart} (${durationLabel})`;
+}
+
+function formatCompactTriggerDate(value: string): string {
+  if (!value) return 'Select date & time';
+  const dt = new Date(value);
+  if (Number.isNaN(dt.getTime())) return 'Select date & time';
+  const datePart = dt.toLocaleDateString('en-IN', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  });
+  const timePart = dt.toLocaleTimeString('en-IN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true,
+  });
+  return `${datePart}, ${timePart}`;
+}
+
 export default function App() {
-  // Theme State (synced with Milo Drive mobile app palette)
   const [theme, setTheme] = useState<ThemeMode>(() => {
     const saved = localStorage.getItem(THEME_STORAGE_KEY);
     return saved === 'light' ? 'light' : 'dark';
@@ -96,14 +144,27 @@ export default function App() {
   // Ride Bookings & Assign Ride Modal State
   const [bookings, setBookings] = useState<Booking[]>([]);
   const [isAssignRideOpen, setIsAssignRideOpen] = useState(false);
+  const [isDateTimePickerOpen, setIsDateTimePickerOpen] = useState(false);
   const [passengerName, setPassengerName] = useState('');
   const [passengerPhone, setPassengerPhone] = useState('');
   const [pickupLocation, setPickupLocation] = useState('');
   const [dropLocation, setDropLocation] = useState('');
-  const [scheduledTime, setScheduledTime] = useState('');
+  const [scheduledDateTimeLocal, setScheduledDateTimeLocal] = useState('');
+  const [minDateTimeLocal, setMinDateTimeLocal] = useState('');
+  const [durationMinutes, setDurationMinutes] = useState<number>(60);
   const [rideNotes, setRideNotes] = useState('');
   const [assigningRide, setAssigningRide] = useState(false);
   const [assignRideError, setAssignRideError] = useState('');
+
+  // Reallocate & Cancel Ride Modal State
+  const [rideToReallocate, setRideToReallocate] = useState<Booking | null>(null);
+  const [selectedNewDriverId, setSelectedNewDriverId] = useState<string>('');
+  const [reallocatingRide, setReallocatingRide] = useState(false);
+  const [reallocateError, setReallocateError] = useState('');
+
+  const [rideToCancel, setRideToCancel] = useState<Booking | null>(null);
+  const [cancellingRide, setCancellingRide] = useState(false);
+  const [cancelError, setCancelError] = useState('');
 
   // Chat State
   const [messages, setMessages] = useState<Message[]>([]);
@@ -127,7 +188,6 @@ export default function App() {
     scrollToBottom();
   }, [messages]);
 
-  // Fetch dynamic rooms (Community Hub + all drivers assigned to this manager)
   const fetchMyRooms = useCallback(async (authToken: string) => {
     setLoadingRooms(true);
     try {
@@ -150,7 +210,6 @@ export default function App() {
     }
   }, []);
 
-  // Fetch all ride bookings assigned by this manager
   const fetchMyBookings = useCallback(async (authToken: string) => {
     try {
       const response = await fetch(
@@ -163,14 +222,13 @@ export default function App() {
       );
       if (response.ok) {
         const data = (await response.json()) as Booking[];
-        setBookings(data);
+        setBookings(data.filter((b) => b.status !== 'cancelled'));
       }
     } catch (error) {
       console.error('Failed to fetch bookings:', error);
     }
   }, []);
 
-  // Handle both Manager Login and Manager Registration with AES encryption
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
@@ -248,7 +306,6 @@ export default function App() {
     }
   };
 
-  // Provision a new driver under the logged-in Manager
   const handleAddDriverSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!token) return;
@@ -325,7 +382,34 @@ export default function App() {
     setAddDriverError('');
   };
 
-  // Assign a new ride booking to the selected driver
+  const findScheduleConflict = useCallback(
+    (
+      driverId: string,
+      candidateStart: Date,
+      candidateDurationMins: number,
+      excludeBookingId?: string
+    ): Booking | undefined => {
+      const candidateEnd = new Date(
+        candidateStart.getTime() + candidateDurationMins * 60_000
+      );
+      return bookings.find((b) => {
+        if (excludeBookingId && b._id === excludeBookingId) return false;
+        if (b.driverId !== driverId) return false;
+        if (b.status === 'cancelled') return false;
+        const existingStart = new Date(b.scheduledAt);
+        const existingEnd = new Date(b.estimatedEndAt);
+        if (
+          Number.isNaN(existingStart.getTime()) ||
+          Number.isNaN(existingEnd.getTime())
+        ) {
+          return false;
+        }
+        return existingStart < candidateEnd && existingEnd > candidateStart;
+      });
+    },
+    [bookings]
+  );
+
   const handleAssignRideSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!token || !activeDriver) return;
@@ -338,10 +422,10 @@ export default function App() {
       !cleanPassengerPhone ||
       !pickupLocation.trim() ||
       !dropLocation.trim() ||
-      !scheduledTime.trim()
+      !scheduledDateTimeLocal
     ) {
       setAssignRideError(
-        'Passenger name, phone, pickup, drop, and scheduled time are required.'
+        'Passenger name, phone, pickup, drop, and pickup date & time are required.'
       );
       return;
     }
@@ -351,8 +435,34 @@ export default function App() {
       return;
     }
 
+    const selectedStart = new Date(scheduledDateTimeLocal);
+    if (Number.isNaN(selectedStart.getTime())) {
+      setAssignRideError('Please choose a valid pickup date and time.');
+      return;
+    }
+
+    if (selectedStart.getTime() < Date.now() - 60_000) {
+      setAssignRideError(
+        'Pickup time cannot be in the past. Select the current or a future time.'
+      );
+      return;
+    }
+
+    const conflict = findScheduleConflict(
+      activeDriver.driverId,
+      selectedStart,
+      durationMinutes
+    );
+    if (conflict) {
+      setAssignRideError(
+        `Cross-timing detected: ${activeDriver.driverName} is already booked for ${conflict.passengerName} at ${conflict.scheduledTime}.`
+      );
+      return;
+    }
+
     setAssigningRide(true);
     try {
+      const formattedLabel = formatScheduleLabel(selectedStart, durationMinutes);
       const response = await fetch('http://localhost:5001/api/bookings', {
         method: 'POST',
         headers: {
@@ -365,7 +475,9 @@ export default function App() {
           passengerPhone: cleanPassengerPhone,
           pickupLocation: pickupLocation.trim(),
           dropLocation: dropLocation.trim(),
-          scheduledTime: scheduledTime.trim(),
+          scheduledAt: selectedStart.toISOString(),
+          scheduledTime: formattedLabel,
+          durationMinutes,
           notes: rideNotes.trim(),
         }),
       });
@@ -373,7 +485,12 @@ export default function App() {
       const data = await response.json();
 
       if (response.ok) {
-        setBookings((prev) => [data as Booking, ...prev]);
+        setBookings((prev) =>
+          [...prev, data as Booking].sort(
+            (a, b) =>
+              new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime()
+          )
+        );
         closeAssignRideModal();
       } else {
         setAssignRideError(data.error || 'Failed to assign ride.');
@@ -385,24 +502,120 @@ export default function App() {
     }
   };
 
+  const handleConfirmCancelRide = async () => {
+    if (!token || !rideToCancel) return;
+    setCancellingRide(true);
+    setCancelError('');
+
+    try {
+      const response = await fetch(
+        `http://localhost:5001/api/bookings/${rideToCancel._id}/cancel`,
+        {
+          method: 'PATCH',
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+
+      const data = await response.json();
+      if (response.ok) {
+        setBookings((prev) => prev.filter((b) => b._id !== rideToCancel._id));
+        setRideToCancel(null);
+      } else {
+        setCancelError(data.error || 'Failed to cancel ride.');
+      }
+    } catch {
+      setCancelError('Network error. Is the backend running?');
+    } finally {
+      setCancellingRide(false);
+    }
+  };
+
+  const handleConfirmReallocateRide = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token || !rideToReallocate || !selectedNewDriverId) return;
+
+    setReallocatingRide(true);
+    setReallocateError('');
+
+    try {
+      const response = await fetch(
+        `http://localhost:5001/api/bookings/${rideToReallocate._id}/reallocate`,
+        {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ newDriverId: selectedNewDriverId }),
+        }
+      );
+
+      const data = await response.json();
+      if (response.ok) {
+        const updated = data as Booking;
+        setBookings((prev) =>
+          prev
+            .map((b) => (b._id === updated._id ? updated : b))
+            .sort(
+              (a, b) =>
+                new Date(a.scheduledAt).getTime() -
+                new Date(b.scheduledAt).getTime()
+            )
+        );
+        setRideToReallocate(null);
+        setSelectedNewDriverId('');
+      } else {
+        setReallocateError(data.error || 'Failed to reallocate ride.');
+      }
+    } catch {
+      setReallocateError('Network error. Is the backend running?');
+    } finally {
+      setReallocatingRide(false);
+    }
+  };
+
   const openAssignRideModal = () => {
+    const now = new Date();
+    const minVal = toDateTimeLocalValue(now);
+    const defaultStart = new Date(now.getTime() + 5 * 60_000);
+    setMinDateTimeLocal(minVal);
+    setScheduledDateTimeLocal(toDateTimeLocalValue(defaultStart));
+    setDurationMinutes(60);
     setPassengerName('');
     setPassengerPhone('');
     setPickupLocation('');
     setDropLocation('');
-    setScheduledTime('');
     setRideNotes('');
     setAssignRideError('');
+    setIsDateTimePickerOpen(false);
     setIsAssignRideOpen(true);
   };
 
   const closeAssignRideModal = () => {
     if (assigningRide) return;
     setIsAssignRideOpen(false);
+    setIsDateTimePickerOpen(false);
     setAssignRideError('');
   };
 
-  // Connect authenticated socket and load manager's rooms & bookings once logged in
+  const openReallocateModal = (ride: Booking) => {
+    setReallocateError('');
+    const candidates = driverRooms.filter((d) => d.driverId !== ride.driverId);
+    const firstAvailable = candidates.find(
+      (d) =>
+        !findScheduleConflict(
+          d.driverId,
+          new Date(ride.scheduledAt),
+          ride.durationMinutes,
+          ride._id
+        )
+    );
+    setSelectedNewDriverId(firstAvailable?.driverId || '');
+    setRideToReallocate(ride);
+  };
+
   useEffect(() => {
     if (!currentUser || !token) return;
 
@@ -431,15 +644,41 @@ export default function App() {
 
     socket.on('booking_status_updated', (updatedBooking: Booking) => {
       setBookings((prev) => {
-        const exists = prev.some((b) => b._id === updatedBooking._id);
-        if (exists) {
-          return prev.map((b) =>
-            b._id === updatedBooking._id ? { ...b, ...updatedBooking } : b
-          );
+        if (updatedBooking.status === 'cancelled') {
+          return prev.filter((b) => b._id !== updatedBooking._id);
         }
-        return [updatedBooking, ...prev];
+        const exists = prev.some((b) => b._id === updatedBooking._id);
+        const nextList = exists
+          ? prev.map((b) =>
+              b._id === updatedBooking._id ? { ...b, ...updatedBooking } : b
+            )
+          : [...prev, updatedBooking];
+        return nextList.sort(
+          (a, b) =>
+            new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime()
+        );
       });
     });
+
+    socket.on(
+      'booking_reallocated',
+      (payload: { bookingId: string; booking: Booking }) => {
+        if (!payload?.booking) return;
+        setBookings((prev) => {
+          const exists = prev.some((b) => b._id === payload.booking._id);
+          const nextList = exists
+            ? prev.map((b) =>
+                b._id === payload.booking._id ? payload.booking : b
+              )
+            : [...prev, payload.booking];
+          return nextList.sort(
+            (a, b) =>
+              new Date(a.scheduledAt).getTime() -
+              new Date(b.scheduledAt).getTime()
+          );
+        });
+      }
+    );
 
     socket.on(
       'display_typing',
@@ -457,13 +696,13 @@ export default function App() {
       socket.off('disconnect');
       socket.off('receive_message');
       socket.off('booking_status_updated');
+      socket.off('booking_reallocated');
       socket.off('display_typing');
       socket.disconnect();
       setIsSocketConnected(false);
     };
   }, [currentUser, token, fetchMyRooms, fetchMyBookings]);
 
-  // Fetch message history and join socket room whenever currentRoom changes
   useEffect(() => {
     if (!currentUser || !token || !currentRoom) return;
 
@@ -529,6 +768,8 @@ export default function App() {
     setPassword('');
     setIsAddDriverOpen(false);
     setIsAssignRideOpen(false);
+    setRideToReallocate(null);
+    setRideToCancel(null);
   };
 
   const formatTime = (isoString?: string) => {
@@ -564,9 +805,29 @@ export default function App() {
 
   const isCommunityActive = currentRoom === communityRoomId;
   const activeDriver = driverRooms.find((d) => d.roomId === currentRoom);
-  const activeDriverLatestBooking = activeDriver
-    ? bookings.find((b) => b.driverId === activeDriver.driverId)
-    : undefined;
+
+  const activeDriverUpcomingBookings = activeDriver
+    ? bookings
+        .filter(
+          (b) =>
+            b.driverId === activeDriver.driverId &&
+            b.status !== 'cancelled' &&
+            new Date(b.estimatedEndAt).getTime() >= Date.now()
+        )
+        .sort(
+          (a, b) =>
+            new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime()
+        )
+    : [];
+
+  const liveModalConflict =
+    isAssignRideOpen && activeDriver && scheduledDateTimeLocal
+      ? (() => {
+          const dt = new Date(scheduledDateTimeLocal);
+          if (Number.isNaN(dt.getTime())) return undefined;
+          return findScheduleConflict(activeDriver.driverId, dt, durationMinutes);
+        })()
+      : undefined;
 
   const filteredDrivers = driverRooms.filter(
     (d) =>
@@ -575,7 +836,7 @@ export default function App() {
   );
 
   // =========================================================================
-  // AUTH VIEW (Manager Sign In / Create Manager Account)
+  // AUTH VIEW
   // =========================================================================
   if (!currentUser || !token) {
     return (
@@ -1177,11 +1438,25 @@ export default function App() {
           ) : (
             filteredDrivers.map((driver) => {
               const isSelected = currentRoom === driver.roomId;
-              const driverLatestRide = bookings.find(
-                (b) => b.driverId === driver.driverId
+              const driverRides = bookings
+                .filter(
+                  (b) =>
+                    b.driverId === driver.driverId &&
+                    b.status !== 'cancelled' &&
+                    new Date(b.estimatedEndAt).getTime() >= Date.now()
+                )
+                .sort(
+                  (a, b) =>
+                    new Date(a.scheduledAt).getTime() -
+                    new Date(b.scheduledAt).getTime()
+                );
+
+              const queryRide = driverRides.find(
+                (r) => r.status === 'query_raised'
               );
-              const badge = driverLatestRide
-                ? getBookingBadgeStyle(driverLatestRide.status)
+              const highlightRide = queryRide || driverRides[0];
+              const badge = highlightRide
+                ? getBookingBadgeStyle(highlightRide.status)
                 : null;
 
               return (
@@ -1346,7 +1621,7 @@ export default function App() {
               >
                 {isCommunityActive
                   ? 'milo'
-                  : (activeDriver?.driverName.charAt(0).toUpperCase() || 'D')}
+                  : activeDriver?.driverName.charAt(0).toUpperCase() || 'D'}
               </div>
               <span
                 style={{
@@ -1420,7 +1695,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Assign Ride Action Button (for active driver room) */}
           {!isCommunityActive && activeDriver && (
             <button
               type="button"
@@ -1441,22 +1715,27 @@ export default function App() {
           )}
         </header>
 
-        {/* Live Assigned Ride Status Banner for Selected Driver */}
-        {!isCommunityActive && activeDriver && activeDriverLatestBooking && (
-          <div
-            style={{
-              padding: '12px 24px',
-              backgroundColor: 'var(--milo-card)',
-              borderBottom: '1px solid var(--milo-border)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              gap: '16px',
-              flexWrap: 'wrap',
-            }}
-          >
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        {/* Upcoming Rides Queue with Reallocate & Cancel Actions */}
+        {!isCommunityActive &&
+          activeDriver &&
+          activeDriverUpcomingBookings.length > 0 && (
+            <div
+              style={{
+                padding: '12px 24px',
+                backgroundColor: 'var(--milo-card)',
+                borderBottom: '1px solid var(--milo-border)',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '8px',
+              }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                }}
+              >
                 <span
                   style={{
                     fontSize: '0.72rem',
@@ -1465,72 +1744,177 @@ export default function App() {
                     color: 'var(--milo-text-muted)',
                   }}
                 >
-                  LATEST ASSIGNED RIDE
+                  UPCOMING RIDES ({activeDriverUpcomingBookings.length}) • EARLIEST FIRST
                 </span>
-                {(() => {
-                  const badge = getBookingBadgeStyle(
-                    activeDriverLatestBooking.status
-                  );
-                  return (
-                    <span
-                      style={{
-                        backgroundColor: badge.bg,
-                        color: badge.color,
-                        border: `1px solid ${badge.border}`,
-                        padding: '2px 8px',
-                        borderRadius: '6px',
-                        fontSize: '0.68rem',
-                        fontWeight: 800,
-                        letterSpacing: '0.04em',
-                      }}
-                    >
-                      {badge.label}
-                    </span>
-                  );
-                })()}
-                <span
+
+                <button
+                  type="button"
+                  onClick={openAssignRideModal}
                   style={{
-                    fontSize: '0.8rem',
-                    fontWeight: 700,
+                    padding: '5px 11px',
+                    borderRadius: '9px',
+                    border: '1px solid var(--milo-border)',
+                    backgroundColor: 'var(--milo-input)',
                     color: 'var(--milo-text)',
+                    fontSize: '0.76rem',
+                    fontWeight: 600,
+                    cursor: 'pointer',
                   }}
                 >
-                  • {activeDriverLatestBooking.scheduledTime}
-                </span>
+                  + Schedule Ride
+                </button>
               </div>
 
               <div
+                className="milo-scroll"
                 style={{
-                  fontSize: '0.84rem',
-                  color: 'var(--milo-text)',
-                  fontWeight: 500,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '8px',
+                  maxHeight: '168px',
+                  overflowY: 'auto',
                 }}
               >
-                <strong>{activeDriverLatestBooking.passengerName}</strong> (
-                {activeDriverLatestBooking.passengerPhone}) —{' '}
-                {activeDriverLatestBooking.pickupLocation} →{' '}
-                {activeDriverLatestBooking.dropLocation}
+                {activeDriverUpcomingBookings.map((ride, index) => {
+                  const badge = getBookingBadgeStyle(ride.status);
+                  const canReallocate = driverRooms.length > 1;
+                  return (
+                    <div
+                      key={ride._id}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: '12px',
+                        padding: '9px 12px',
+                        borderRadius: '10px',
+                        backgroundColor: 'var(--milo-input)',
+                        border:
+                          ride.status === 'query_raised'
+                            ? '1px solid rgba(231, 76, 60, 0.55)'
+                            : index === 0
+                            ? '1px solid var(--milo-burgundy-light)'
+                            : '1px solid var(--milo-border)',
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      <div style={{ flex: 1, minWidth: '240px' }}>
+                        <div
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            flexWrap: 'wrap',
+                          }}
+                        >
+                          <span
+                            style={{
+                              fontSize: '0.72rem',
+                              fontWeight: 800,
+                              color: 'var(--milo-burgundy-light)',
+                            }}
+                          >
+                            #{index + 1}
+                          </span>
+                          <span
+                            style={{
+                              backgroundColor: badge.bg,
+                              color: badge.color,
+                              border: `1px solid ${badge.border}`,
+                              padding: '1px 7px',
+                              borderRadius: '5px',
+                              fontSize: '0.66rem',
+                              fontWeight: 800,
+                            }}
+                          >
+                            {badge.label}
+                          </span>
+                          <span
+                            style={{
+                              fontSize: '0.8rem',
+                              fontWeight: 700,
+                              color: 'var(--milo-text)',
+                            }}
+                          >
+                            {ride.scheduledTime}
+                          </span>
+                          <span
+                            style={{
+                              fontSize: '0.8rem',
+                              color: 'var(--milo-text-muted)',
+                            }}
+                          >
+                            • <strong style={{ color: 'var(--milo-text)' }}>{ride.passengerName}</strong> ({ride.passengerPhone}): {ride.pickupLocation} → {ride.dropLocation}
+                          </span>
+                        </div>
+
+                        {ride.status === 'query_raised' && ride.queryMessage && (
+                          <div
+                            style={{
+                              marginTop: '4px',
+                              fontSize: '0.76rem',
+                              color: 'var(--milo-error-text)',
+                              fontWeight: 600,
+                            }}
+                          >
+                            Driver Query: “{ride.queryMessage}”
+                          </div>
+                        )}
+                      </div>
+
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <button
+                          type="button"
+                          onClick={() => openReallocateModal(ride)}
+                          disabled={!canReallocate}
+                          title={
+                            canReallocate
+                              ? 'Reallocate ride to another driver'
+                              : 'Add at least 2 drivers to reallocate rides'
+                          }
+                          style={{
+                            padding: '5px 10px',
+                            borderRadius: '8px',
+                            border: '1px solid var(--milo-border)',
+                            backgroundColor: 'var(--milo-card)',
+                            color: canReallocate
+                              ? 'var(--milo-text)'
+                              : 'var(--milo-text-muted)',
+                            fontSize: '0.74rem',
+                            fontWeight: 600,
+                            cursor: canReallocate ? 'pointer' : 'not-allowed',
+                            opacity: canReallocate ? 1 : 0.55,
+                          }}
+                        >
+                          Reallocate
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setCancelError('');
+                            setRideToCancel(ride);
+                          }}
+                          style={{
+                            padding: '5px 10px',
+                            borderRadius: '8px',
+                            border: '1px solid rgba(231, 76, 60, 0.35)',
+                            backgroundColor: 'var(--milo-error-bg)',
+                            color: 'var(--milo-error-text)',
+                            fontSize: '0.74rem',
+                            fontWeight: 600,
+                            cursor: 'pointer',
+                          }}
+                        >
+                          Cancel Ride
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
-
-            <button
-              type="button"
-              onClick={openAssignRideModal}
-              style={{
-                padding: '7px 12px',
-                borderRadius: '10px',
-                border: '1px solid var(--milo-border)',
-                backgroundColor: 'var(--milo-input)',
-                color: 'var(--milo-text)',
-                fontSize: '0.78rem',
-                fontWeight: 600,
-                cursor: 'pointer',
-              }}
-            >
-              + New Ride
-            </button>
-          </div>
-        )}
+          )}
 
         {/* Scrollable Message Stream */}
         <div
@@ -1543,7 +1927,6 @@ export default function App() {
             flexDirection: 'column',
           }}
         >
-          {/* Today Pill Divider */}
           <div
             style={{
               display: 'flex',
@@ -1577,7 +1960,7 @@ export default function App() {
             >
               {isCommunityActive
                 ? 'Broadcast fleet updates to all drivers in Community Hub.'
-                : `Send a direct message or assign a ride to ${activeDriver?.driverName || 'your driver'}.`}
+                : `Send a direct message or schedule a ride for ${activeDriver?.driverName || 'your driver'}.`}
             </div>
           )}
 
@@ -1693,7 +2076,346 @@ export default function App() {
       </main>
 
       {/* =================================================================== */}
-      {/* ASSIGN RIDE MODAL                                                   */}
+      {/* REALLOCATE RIDE MODAL                                               */}
+      {/* =================================================================== */}
+      {rideToReallocate && (
+        <div
+          onClick={() => !reallocatingRide && setRideToReallocate(null)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.65)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            justifyContent: 'center',
+            alignItems: 'center',
+            padding: '16px',
+            zIndex: 1000,
+          }}
+        >
+          <form
+            onSubmit={handleConfirmReallocateRide}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              backgroundColor: 'var(--milo-card)',
+              border: '1px solid var(--milo-border)',
+              borderRadius: '22px',
+              padding: '26px',
+              width: '100%',
+              maxWidth: '450px',
+              boxShadow: 'var(--milo-shadow)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '14px',
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+              }}
+            >
+              <div>
+                <h3
+                  style={{
+                    margin: 0,
+                    fontSize: '1.15rem',
+                    fontWeight: 700,
+                    color: 'var(--milo-text)',
+                  }}
+                >
+                  Reallocate Ride
+                </h3>
+                <p
+                  style={{
+                    margin: '3px 0 0',
+                    fontSize: '0.8rem',
+                    color: 'var(--milo-text-muted)',
+                  }}
+                >
+                  Reassign {rideToReallocate.passengerName} ({rideToReallocate.scheduledTime})
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => !reallocatingRide && setRideToReallocate(null)}
+                style={{
+                  background: 'var(--milo-input)',
+                  border: '1px solid var(--milo-border)',
+                  borderRadius: '8px',
+                  width: '30px',
+                  height: '30px',
+                  color: 'var(--milo-text-muted)',
+                  fontSize: '1.1rem',
+                  cursor: 'pointer',
+                }}
+              >
+                ×
+              </button>
+            </div>
+
+            {reallocateError && (
+              <div
+                style={{
+                  backgroundColor: 'var(--milo-error-bg)',
+                  color: 'var(--milo-error-text)',
+                  border: '1px solid rgba(231, 76, 60, 0.35)',
+                  borderRadius: '12px',
+                  padding: '10px 12px',
+                  fontSize: '0.83rem',
+                  fontWeight: 500,
+                }}
+              >
+                {reallocateError}
+              </div>
+            )}
+
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '8px',
+                maxHeight: '240px',
+                overflowY: 'auto',
+              }}
+            >
+              {driverRooms
+                .filter((d) => d.driverId !== rideToReallocate.driverId)
+                .map((candidate) => {
+                  const conflict = findScheduleConflict(
+                    candidate.driverId,
+                    new Date(rideToReallocate.scheduledAt),
+                    rideToReallocate.durationMinutes,
+                    rideToReallocate._id
+                  );
+                  const isBusy = Boolean(conflict);
+                  const isChosen = selectedNewDriverId === candidate.driverId;
+
+                  return (
+                    <button
+                      key={candidate.driverId}
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => setSelectedNewDriverId(candidate.driverId)}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        padding: '11px 14px',
+                        borderRadius: '12px',
+                        border: isChosen
+                          ? '1.5px solid var(--milo-burgundy-light)'
+                          : '1px solid var(--milo-border)',
+                        backgroundColor: isChosen
+                          ? 'rgba(110, 29, 61, 0.2)'
+                          : 'var(--milo-input)',
+                        color: 'var(--milo-text)',
+                        cursor: isBusy ? 'not-allowed' : 'pointer',
+                        opacity: isBusy ? 0.55 : 1,
+                        textAlign: 'left',
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontWeight: 700, fontSize: '0.9rem' }}>
+                          {candidate.driverName}
+                        </div>
+                        <div
+                          style={{
+                            fontSize: '0.76rem',
+                            color: 'var(--milo-text-muted)',
+                          }}
+                        >
+                          {candidate.driverPhone}
+                        </div>
+                      </div>
+
+                      <span
+                        style={{
+                          backgroundColor: isBusy
+                            ? 'var(--milo-error-bg)'
+                            : 'var(--milo-success-bg)',
+                          color: isBusy
+                            ? 'var(--milo-error-text)'
+                            : 'var(--milo-success-text)',
+                          padding: '3px 8px',
+                          borderRadius: '6px',
+                          fontSize: '0.7rem',
+                          fontWeight: 700,
+                        }}
+                      >
+                        {isBusy ? 'BUSY AT THIS TIME' : 'AVAILABLE'}
+                      </span>
+                    </button>
+                  );
+                })}
+            </div>
+
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'flex-end',
+                gap: '10px',
+                marginTop: '6px',
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => !reallocatingRide && setRideToReallocate(null)}
+                disabled={reallocatingRide}
+                style={{
+                  padding: '10px 16px',
+                  borderRadius: '12px',
+                  border: '1px solid var(--milo-border)',
+                  backgroundColor: 'var(--milo-input)',
+                  color: 'var(--milo-text)',
+                  fontWeight: 600,
+                  fontSize: '0.86rem',
+                  cursor: 'pointer',
+                }}
+              >
+                Close
+              </button>
+              <button
+                type="submit"
+                disabled={reallocatingRide || !selectedNewDriverId}
+                className="milo-btn-primary"
+                style={{
+                  padding: '10px 18px',
+                  fontSize: '0.86rem',
+                }}
+              >
+                {reallocatingRide ? 'Reallocating...' : 'Confirm Reallocation'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* =================================================================== */}
+      {/* CANCEL RIDE CONFIRMATION MODAL                                      */}
+      {/* =================================================================== */}
+      {rideToCancel && (
+        <div
+          onClick={() => !cancellingRide && setRideToCancel(null)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.65)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            justifyContent: 'center',
+            alignItems: 'center',
+            padding: '16px',
+            zIndex: 1000,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              backgroundColor: 'var(--milo-card)',
+              border: '1px solid var(--milo-border)',
+              borderRadius: '22px',
+              padding: '26px',
+              width: '100%',
+              maxWidth: '410px',
+              boxShadow: 'var(--milo-shadow)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '14px',
+            }}
+          >
+            <h3
+              style={{
+                margin: 0,
+                fontSize: '1.15rem',
+                fontWeight: 700,
+                color: 'var(--milo-text)',
+              }}
+            >
+              Cancel Upcoming Ride?
+            </h3>
+            <p
+              style={{
+                margin: 0,
+                fontSize: '0.85rem',
+                color: 'var(--milo-text-muted)',
+                lineHeight: 1.45,
+              }}
+            >
+              This will cancel the ride for{' '}
+              <strong style={{ color: 'var(--milo-text)' }}>
+                {rideToCancel.passengerName}
+              </strong>{' '}
+              at <strong>{rideToCancel.scheduledTime}</strong>, notify{' '}
+              <strong>{rideToCancel.driverName || 'the driver'}</strong>, and
+              free up their schedule slot.
+            </p>
+
+            {cancelError && (
+              <div
+                style={{
+                  backgroundColor: 'var(--milo-error-bg)',
+                  color: 'var(--milo-error-text)',
+                  border: '1px solid rgba(231, 76, 60, 0.35)',
+                  borderRadius: '12px',
+                  padding: '10px 12px',
+                  fontSize: '0.83rem',
+                }}
+              >
+                {cancelError}
+              </div>
+            )}
+
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'flex-end',
+                gap: '10px',
+                marginTop: '6px',
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => !cancellingRide && setRideToCancel(null)}
+                disabled={cancellingRide}
+                style={{
+                  padding: '10px 16px',
+                  borderRadius: '12px',
+                  border: '1px solid var(--milo-border)',
+                  backgroundColor: 'var(--milo-input)',
+                  color: 'var(--milo-text)',
+                  fontWeight: 600,
+                  fontSize: '0.86rem',
+                  cursor: 'pointer',
+                }}
+              >
+                Keep Ride
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmCancelRide}
+                disabled={cancellingRide}
+                style={{
+                  padding: '10px 18px',
+                  borderRadius: '12px',
+                  border: 'none',
+                  backgroundColor: '#C0392B',
+                  color: '#ffffff',
+                  fontWeight: 700,
+                  fontSize: '0.86rem',
+                  cursor: 'pointer',
+                }}
+              >
+                {cancellingRide ? 'Cancelling...' : 'Yes, Cancel Ride'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* =================================================================== */}
+      {/* ASSIGN RIDE MODAL WITH CUSTOM MILO DATE & TIME PICKER               */}
       {/* =================================================================== */}
       {isAssignRideOpen && activeDriver && (
         <div
@@ -1713,13 +2435,14 @@ export default function App() {
           <form
             onSubmit={handleAssignRideSubmit}
             onClick={(e) => e.stopPropagation()}
+            className="milo-scroll"
             style={{
               backgroundColor: 'var(--milo-card)',
               border: '1px solid var(--milo-border)',
               borderRadius: '22px',
               padding: '26px',
               width: '100%',
-              maxWidth: '450px',
+              maxWidth: '470px',
               boxShadow: 'var(--milo-shadow)',
               display: 'flex',
               flexDirection: 'column',
@@ -1753,7 +2476,7 @@ export default function App() {
                     color: 'var(--milo-text-muted)',
                   }}
                 >
-                  Triggers an instant full-screen booking card on the driver&apos;s phone
+                  Select pickup date & time (present or future, zero cross-timing)
                 </p>
               </div>
               <button
@@ -1788,6 +2511,24 @@ export default function App() {
                 }}
               >
                 {assignRideError}
+              </div>
+            )}
+
+            {!assignRideError && liveModalConflict && (
+              <div
+                style={{
+                  backgroundColor: 'var(--milo-error-bg)',
+                  color: 'var(--milo-error-text)',
+                  border: '1px solid rgba(231, 76, 60, 0.35)',
+                  borderRadius: '12px',
+                  padding: '10px 12px',
+                  fontSize: '0.82rem',
+                  fontWeight: 500,
+                }}
+              >
+                Cross-timing warning: Overlaps with{' '}
+                <strong>{liveModalConflict.passengerName}</strong> (
+                {liveModalConflict.scheduledTime})
               </div>
             )}
 
@@ -1905,27 +2646,112 @@ export default function App() {
               />
             </div>
 
-            <div>
-              <label
-                style={{
-                  display: 'block',
-                  fontSize: '0.76rem',
-                  fontWeight: 600,
-                  color: 'var(--milo-text-muted)',
-                  marginBottom: '5px',
-                }}
-              >
-                Scheduled Pickup Time
-              </label>
-              <input
-                type="text"
-                className="milo-input"
-                placeholder="e.g. Today, 5:30 PM"
-                value={scheduledTime}
-                onChange={(e) => setScheduledTime(e.target.value)}
-                required
-              />
+            {/* Pickup Date & Time Trigger + Trip Duration */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1.45fr 1fr', gap: '10px' }}>
+              <div>
+                <label
+                  style={{
+                    display: 'block',
+                    fontSize: '0.76rem',
+                    fontWeight: 600,
+                    color: 'var(--milo-text-muted)',
+                    marginBottom: '5px',
+                  }}
+                >
+                  Pickup Date & Time
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setIsDateTimePickerOpen((prev) => !prev)}
+                  style={{
+                    width: '100%',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '8px',
+                    padding: '10px 12px',
+                    borderRadius: '12px',
+                    border: isDateTimePickerOpen
+                      ? '1.5px solid var(--milo-burgundy-light)'
+                      : '1px solid var(--milo-border)',
+                    backgroundColor: 'var(--milo-input)',
+                    color: 'var(--milo-text)',
+                    fontSize: '0.84rem',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    textAlign: 'left',
+                  }}
+                >
+                  <span
+                    style={{
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                    }}
+                  >
+                    {formatCompactTriggerDate(scheduledDateTimeLocal)}
+                  </span>
+                  <span
+                    style={{
+                      width: '24px',
+                      height: '24px',
+                      borderRadius: '7px',
+                      backgroundColor: 'rgba(110, 29, 61, 0.22)',
+                      color: 'var(--milo-burgundy-light)',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      fontSize: '0.78rem',
+                      flexShrink: 0,
+                    }}
+                  >
+                    📅
+                  </span>
+                </button>
+              </div>
+
+              <div>
+                <label
+                  style={{
+                    display: 'block',
+                    fontSize: '0.76rem',
+                    fontWeight: 600,
+                    color: 'var(--milo-text-muted)',
+                    marginBottom: '5px',
+                  }}
+                >
+                  Trip Duration
+                </label>
+                <select
+                  className="milo-input"
+                  value={durationMinutes}
+                  onChange={(e) => {
+                    setDurationMinutes(Number(e.target.value));
+                    setAssignRideError('');
+                  }}
+                >
+                  <option value={30}>30 mins</option>
+                  <option value={60}>1 hour</option>
+                  <option value={90}>1.5 hours</option>
+                  <option value={120}>2 hours</option>
+                  <option value={180}>3 hours</option>
+                  <option value={240}>4 hours</option>
+                </select>
+              </div>
             </div>
+
+            {/* Custom Milo-Styled Calendar & Time Picker */}
+            {isDateTimePickerOpen && (
+              <MiloDateTimePicker
+                value={scheduledDateTimeLocal}
+                min={minDateTimeLocal}
+                onChange={(nextVal) => {
+                  setScheduledDateTimeLocal(nextVal);
+                  setAssignRideError('');
+                }}
+                onClose={() => setIsDateTimePickerOpen(false)}
+              />
+            )}
 
             <div>
               <label
@@ -1975,7 +2801,11 @@ export default function App() {
               </button>
               <button
                 type="submit"
-                disabled={assigningRide || passengerPhone.length !== 10}
+                disabled={
+                  assigningRide ||
+                  passengerPhone.length !== 10 ||
+                  Boolean(liveModalConflict)
+                }
                 className="milo-btn-primary"
                 style={{
                   padding: '10px 18px',
@@ -2241,9 +3071,553 @@ export default function App() {
   );
 }
 
-// ===========================================================================
-// REUSABLE DARK / LIGHT PILL TOGGLE
-// ===========================================================================
+// =============================================================================
+// CUSTOM MILO-ALIGNED DATE & TIME PICKER COMPONENT
+// =============================================================================
+function MiloDateTimePicker({
+  value,
+  min,
+  onChange,
+  onClose,
+}: {
+  value: string;
+  min: string;
+  onChange: (nextValue: string) => void;
+  onClose: () => void;
+}) {
+  const current = value ? new Date(value) : new Date();
+  const safeCurrent = Number.isNaN(current.getTime()) ? new Date() : current;
+
+  const minDateObj = min ? new Date(min) : new Date();
+  const safeMin = Number.isNaN(minDateObj.getTime()) ? new Date() : minDateObj;
+
+  const [viewYear, setViewYear] = useState<number>(safeCurrent.getFullYear());
+  const [viewMonth, setViewMonth] = useState<number>(safeCurrent.getMonth());
+
+  const hourListRef = useRef<HTMLDivElement | null>(null);
+  const minuteListRef = useRef<HTMLDivElement | null>(null);
+
+  const selectedYear = safeCurrent.getFullYear();
+  const selectedMonth = safeCurrent.getMonth();
+  const selectedDay = safeCurrent.getDate();
+  const hours24 = safeCurrent.getHours();
+  const selectedMinute = safeCurrent.getMinutes();
+  const isPM = hours24 >= 12;
+  const selectedHour12 = hours24 % 12 === 0 ? 12 : hours24 % 12;
+
+  useEffect(() => {
+    const activeHourEl = hourListRef.current?.querySelector(
+      '[data-selected="true"]'
+    ) as HTMLElement | null;
+    if (activeHourEl && hourListRef.current) {
+      hourListRef.current.scrollTop =
+        activeHourEl.offsetTop - hourListRef.current.clientHeight / 2 + 16;
+    }
+
+    const activeMinEl = minuteListRef.current?.querySelector(
+      '[data-selected="true"]'
+    ) as HTMLElement | null;
+    if (activeMinEl && minuteListRef.current) {
+      minuteListRef.current.scrollTop =
+        activeMinEl.offsetTop - minuteListRef.current.clientHeight / 2 + 16;
+    }
+  }, []);
+
+  const commitSelection = (
+    year: number,
+    month: number,
+    day: number,
+    hour12: number,
+    minute: number,
+    pm: boolean
+  ) => {
+    let h24 = hour12 % 12;
+    if (pm) h24 += 12;
+
+    let candidate = new Date(year, month, day, h24, minute, 0, 0);
+    if (candidate.getTime() < safeMin.getTime()) {
+      candidate = new Date(safeMin.getTime());
+    }
+    onChange(toDateTimeLocalValue(candidate));
+  };
+
+  const applyQuickPreset = (offsetMinutes?: number, tomorrow9Am?: boolean) => {
+    const base = new Date();
+    let target: Date;
+    if (tomorrow9Am) {
+      target = new Date(
+        base.getFullYear(),
+        base.getMonth(),
+        base.getDate() + 1,
+        9,
+        0,
+        0,
+        0
+      );
+    } else {
+      target = new Date(base.getTime() + (offsetMinutes || 15) * 60_000);
+    }
+    setViewYear(target.getFullYear());
+    setViewMonth(target.getMonth());
+    onChange(toDateTimeLocalValue(target));
+  };
+
+  const monthLabel = new Date(viewYear, viewMonth, 1).toLocaleDateString(
+    'en-IN',
+    {
+      month: 'long',
+      year: 'numeric',
+    }
+  );
+
+  const canGoPrevMonth =
+    viewYear > safeMin.getFullYear() ||
+    (viewYear === safeMin.getFullYear() && viewMonth > safeMin.getMonth());
+
+  const goPrevMonth = () => {
+    if (!canGoPrevMonth) return;
+    if (viewMonth === 0) {
+      setViewYear((y) => y - 1);
+      setViewMonth(11);
+    } else {
+      setViewMonth((m) => m - 1);
+    }
+  };
+
+  const goNextMonth = () => {
+    if (viewMonth === 11) {
+      setViewYear((y) => y + 1);
+      setViewMonth(0);
+    } else {
+      setViewMonth((m) => m + 1);
+    }
+  };
+
+  const firstWeekday = new Date(viewYear, viewMonth, 1).getDay();
+  const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
+  const calendarCells: Array<number | null> = [
+    ...Array.from({ length: firstWeekday }, () => null),
+    ...Array.from({ length: daysInMonth }, (_, i) => i + 1),
+  ];
+
+  const today = new Date();
+  const hours12List = Array.from({ length: 12 }, (_, i) => i + 1);
+  const minutesList = Array.from({ length: 60 }, (_, i) => i);
+
+  return (
+    <div
+      style={{
+        backgroundColor: 'var(--milo-input)',
+        border: '1px solid var(--milo-burgundy-light)',
+        borderRadius: '16px',
+        padding: '14px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '12px',
+      }}
+    >
+      {/* Quick Presets */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '6px',
+          flexWrap: 'wrap',
+        }}
+      >
+        <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+          {[
+            { label: '+15 mins', onClick: () => applyQuickPreset(15) },
+            { label: '+1 hour', onClick: () => applyQuickPreset(60) },
+            { label: 'Tomorrow 9 AM', onClick: () => applyQuickPreset(0, true) },
+          ].map((preset) => (
+            <button
+              key={preset.label}
+              type="button"
+              onClick={preset.onClick}
+              style={{
+                padding: '4px 10px',
+                borderRadius: '999px',
+                border: '1px solid var(--milo-border)',
+                backgroundColor: 'var(--milo-card)',
+                color: 'var(--milo-text)',
+                fontSize: '0.72rem',
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
+
+        <button
+          type="button"
+          onClick={onClose}
+          style={{
+            padding: '4px 11px',
+            borderRadius: '8px',
+            border: 'none',
+            backgroundColor: 'var(--milo-burgundy)',
+            color: '#ffffff',
+            fontSize: '0.73rem',
+            fontWeight: 700,
+            cursor: 'pointer',
+          }}
+        >
+          Done
+        </button>
+      </div>
+
+      {/* Side-by-Side Calendar Grid & Time Columns */}
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: '1.35fr 1fr',
+          gap: '12px',
+          alignItems: 'stretch',
+        }}
+      >
+        {/* Left: Month Calendar */}
+        <div
+          style={{
+            backgroundColor: 'var(--milo-card)',
+            border: '1px solid var(--milo-border)',
+            borderRadius: '12px',
+            padding: '10px',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              marginBottom: '8px',
+            }}
+          >
+            <span
+              style={{
+                fontSize: '0.8rem',
+                fontWeight: 700,
+                color: 'var(--milo-text)',
+              }}
+            >
+              {monthLabel}
+            </span>
+            <div style={{ display: 'flex', gap: '4px' }}>
+              <button
+                type="button"
+                onClick={goPrevMonth}
+                disabled={!canGoPrevMonth}
+                style={{
+                  width: '24px',
+                  height: '24px',
+                  borderRadius: '7px',
+                  border: '1px solid var(--milo-border)',
+                  backgroundColor: 'var(--milo-input)',
+                  color: canGoPrevMonth
+                    ? 'var(--milo-text)'
+                    : 'var(--milo-text-muted)',
+                  opacity: canGoPrevMonth ? 1 : 0.4,
+                  cursor: canGoPrevMonth ? 'pointer' : 'not-allowed',
+                  fontSize: '0.78rem',
+                }}
+              >
+                ‹
+              </button>
+              <button
+                type="button"
+                onClick={goNextMonth}
+                style={{
+                  width: '24px',
+                  height: '24px',
+                  borderRadius: '7px',
+                  border: '1px solid var(--milo-border)',
+                  backgroundColor: 'var(--milo-input)',
+                  color: 'var(--milo-text)',
+                  cursor: 'pointer',
+                  fontSize: '0.78rem',
+                }}
+              >
+                ›
+              </button>
+            </div>
+          </div>
+
+          {/* Weekday Labels */}
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(7, 1fr)',
+              textAlign: 'center',
+              marginBottom: '4px',
+            }}
+          >
+            {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((d, idx) => (
+              <span
+                key={idx}
+                style={{
+                  fontSize: '0.67rem',
+                  fontWeight: 700,
+                  color: 'var(--milo-text-muted)',
+                }}
+              >
+                {d}
+              </span>
+            ))}
+          </div>
+
+          {/* Day Cells */}
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(7, 1fr)',
+              gap: '2px',
+            }}
+          >
+            {calendarCells.map((dayNum, idx) => {
+              if (!dayNum) {
+                return <div key={`empty-${idx}`} style={{ height: '26px' }} />;
+              }
+
+              const endOfDay = new Date(viewYear, viewMonth, dayNum, 23, 59, 59);
+              const isPastDay = endOfDay.getTime() < safeMin.getTime();
+              const isSelected =
+                viewYear === selectedYear &&
+                viewMonth === selectedMonth &&
+                dayNum === selectedDay;
+              const isToday =
+                viewYear === today.getFullYear() &&
+                viewMonth === today.getMonth() &&
+                dayNum === today.getDate();
+
+              return (
+                <button
+                  key={dayNum}
+                  type="button"
+                  disabled={isPastDay}
+                  onClick={() =>
+                    commitSelection(
+                      viewYear,
+                      viewMonth,
+                      dayNum,
+                      selectedHour12,
+                      selectedMinute,
+                      isPM
+                    )
+                  }
+                  style={{
+                    height: '26px',
+                    borderRadius: '7px',
+                    border:
+                      isToday && !isSelected
+                        ? '1px solid var(--milo-burgundy-light)'
+                        : '1px solid transparent',
+                    backgroundColor: isSelected
+                      ? 'var(--milo-burgundy)'
+                      : 'transparent',
+                    color: isSelected
+                      ? '#ffffff'
+                      : isPastDay
+                      ? 'var(--milo-text-muted)'
+                      : 'var(--milo-text)',
+                    opacity: isPastDay ? 0.35 : 1,
+                    fontSize: '0.74rem',
+                    fontWeight: isSelected || isToday ? 700 : 500,
+                    cursor: isPastDay ? 'not-allowed' : 'pointer',
+                    padding: 0,
+                  }}
+                >
+                  {dayNum}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Right: Hour / Minute / AM-PM Columns */}
+        <div
+          style={{
+            backgroundColor: 'var(--milo-card)',
+            border: '1px solid var(--milo-border)',
+            borderRadius: '12px',
+            padding: '10px 8px',
+            display: 'flex',
+            flexDirection: 'column',
+          }}
+        >
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr 1fr',
+              textAlign: 'center',
+              fontSize: '0.65rem',
+              fontWeight: 700,
+              color: 'var(--milo-text-muted)',
+              marginBottom: '6px',
+            }}
+          >
+            <span>HR</span>
+            <span>MIN</span>
+            <span>AM/PM</span>
+          </div>
+
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr 1fr',
+              gap: '4px',
+              height: '164px',
+            }}
+          >
+            {/* Hours */}
+            <div
+              ref={hourListRef}
+              className="milo-scroll"
+              style={{
+                overflowY: 'auto',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '3px',
+                position: 'relative',
+              }}
+            >
+              {hours12List.map((hr) => {
+                const active = hr === selectedHour12;
+                return (
+                  <button
+                    key={hr}
+                    type="button"
+                    data-selected={active}
+                    onClick={() =>
+                      commitSelection(
+                        selectedYear,
+                        selectedMonth,
+                        selectedDay,
+                        hr,
+                        selectedMinute,
+                        isPM
+                      )
+                    }
+                    style={{
+                      padding: '5px 0',
+                      borderRadius: '7px',
+                      border: 'none',
+                      backgroundColor: active
+                        ? 'var(--milo-burgundy)'
+                        : 'transparent',
+                      color: active ? '#ffffff' : 'var(--milo-text)',
+                      fontSize: '0.76rem',
+                      fontWeight: active ? 700 : 500,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {String(hr).padStart(2, '0')}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Minutes */}
+            <div
+              ref={minuteListRef}
+              className="milo-scroll"
+              style={{
+                overflowY: 'auto',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '3px',
+                position: 'relative',
+              }}
+            >
+              {minutesList.map((minVal) => {
+                const active = minVal === selectedMinute;
+                return (
+                  <button
+                    key={minVal}
+                    type="button"
+                    data-selected={active}
+                    onClick={() =>
+                      commitSelection(
+                        selectedYear,
+                        selectedMonth,
+                        selectedDay,
+                        selectedHour12,
+                        minVal,
+                        isPM
+                      )
+                    }
+                    style={{
+                      padding: '5px 0',
+                      borderRadius: '7px',
+                      border: 'none',
+                      backgroundColor: active
+                        ? 'var(--milo-burgundy)'
+                        : 'transparent',
+                      color: active ? '#ffffff' : 'var(--milo-text)',
+                      fontSize: '0.76rem',
+                      fontWeight: active ? 700 : 500,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {String(minVal).padStart(2, '0')}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* AM / PM */}
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '6px',
+              }}
+            >
+              {[false, true].map((pmOption) => {
+                const active = isPM === pmOption;
+                return (
+                  <button
+                    key={pmOption ? 'PM' : 'AM'}
+                    type="button"
+                    onClick={() =>
+                      commitSelection(
+                        selectedYear,
+                        selectedMonth,
+                        selectedDay,
+                        selectedHour12,
+                        selectedMinute,
+                        pmOption
+                      )
+                    }
+                    style={{
+                      padding: '8px 0',
+                      borderRadius: '8px',
+                      border: active
+                        ? 'none'
+                        : '1px solid var(--milo-border)',
+                      backgroundColor: active
+                        ? 'var(--milo-burgundy)'
+                        : 'var(--milo-input)',
+                      color: active ? '#ffffff' : 'var(--milo-text)',
+                      fontSize: '0.75rem',
+                      fontWeight: 700,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {pmOption ? 'PM' : 'AM'}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ThemePillToggle({
   theme,
   onChange,
